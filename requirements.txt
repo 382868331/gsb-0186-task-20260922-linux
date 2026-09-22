@@ -1,1 +1,1 @@
-# Python 3.14.7 standard library only.
+# Python 3.14.7 标准库即可，无需安装任何第三方依赖。
