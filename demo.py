@@ -195,6 +195,106 @@ def run_limit_scale_pass():
           f"用时 {dt:.2f}s。")
 
 
+def run_update_pass():
+    """顶点更新演示：拓扑不变更新 + 自底向上 refit，与全量重建/暴力参考比对。"""
+    t0 = time.perf_counter()
+    print("\n[顶点更新] 拓扑不变的顶点位置更新（原地 refit）")
+    tris = make_scene()
+    bvh = build(tris)
+    probe_ray = Ray((3.0, -0.5, 0.0), (0.05, 0.02, 1.0))
+    before = intersect(bvh, probe_ray, 0.5)
+    print(f"  更新前探测：hit={before.hit} face_id={before.face_id} "
+          f"t={before.t:.4f}")
+
+    # 第一次更新：全部顶点平移 (+40, +5, 0)，整体跨出旧包围盒
+    def shifted(trs, dx, dy, dz):
+        out = []
+        for t in trs:
+            pts = [tuple(p[k] + (dx, dy, dz)[k] for k in range(3))
+                   for p in (t.a0, t.b0, t.c0, t.a1, t.b1, t.c1)]
+            out.append(Triangle(*pts, face_id=t.face_id))
+        return out
+
+    moved = shifted(tris, 40.0, 5.0, 0.0)
+    bvh.update_vertices(moved)
+    rebuilt = build(moved)
+    # 固定查询集：更新树 vs 全量重建 vs 独立暴力参考，逐条三方一致
+    rng = random.Random(20260924)
+    queries = []
+    for _ in range(60):
+        tau = rng.choice((0.0, 0.25, 0.5, 0.75, 1.0))
+        tgt = moved[rng.randrange(len(moved))]
+        # τ 时刻的插值质心
+        c = tuple(
+            sum(getattr(tgt, f"{w}0")[k] * (1.0 - tau)
+                + getattr(tgt, f"{w}1")[k] * tau for w in "abc") / 3.0
+            for k in range(3))
+        o = (c[0] + rng.uniform(-15, 15), c[1] + rng.uniform(-15, 15),
+             c[2] + rng.uniform(4, 12))
+        queries.append((Ray(o, tuple(c[k] - o[k] for k in range(3))), tau))
+    agree_rebuild = agree_ref = 0
+    for ray, tau in queries:
+        g = intersect(bvh, ray, tau)
+        r = intersect(rebuilt, ray, tau)
+        e = reference_intersect(moved, ray, tau)
+        same = (g.hit == r.hit and g.face_id == r.face_id
+                and (not g.hit or (g.t == r.t and g.u == r.u and g.v == r.v)))
+        agree_rebuild += same
+        agree_ref += (g.hit == e["hit"]
+                      and (not g.hit or g.face_id == e["face_id"]))
+    print(f"  第一次更新（+40x 跨旧包围盒）× {len(queries)} 条射线："
+          f"与全量重建逐位一致 {agree_rebuild}/{len(queries)}，"
+          f"与暴力参考一致 {agree_ref}/{len(queries)}")
+    assert agree_rebuild == len(queries) and agree_ref == len(queries)
+
+    # 旧位置射线现在未命中；新位置命中（平移解析关系：命中点随顶点平移）
+    moved_probe = Ray((probe_ray.origin[0] + 40.0, probe_ray.origin[1] + 5.0,
+                       probe_ray.origin[2]), probe_ray.direction)
+    after_old = intersect(bvh, probe_ray, 0.5)
+    after_new = intersect(bvh, moved_probe, 0.5)
+    print(f"  旧位置射线 hit={after_old.hit}；平移后射线 hit={after_new.hit} "
+          f"face_id={after_new.face_id} t={after_new.t:.4f}")
+    assert not after_old.hit  # 整个场景已搬离，旧位置证明无解
+    assert after_new.hit == before.hit and after_new.face_id == before.face_id
+
+    # 第二次连续更新：移回并混入一个退化（零面积）三角形
+    back = shifted(moved, -40.0, -5.0, 0.0)
+    back[3] = Triangle.stationary((0.0, 0.0, 2.0), (0.0, 0.0, 2.0),
+                                  (0.0, 0.0, 2.0), face_id=back[3].face_id)
+    bvh.update_vertices(back)
+    rebuilt2 = build(back)
+    ok2 = 0
+    for ray, tau in queries:
+        g = intersect(bvh, ray, tau)
+        r = intersect(rebuilt2, ray, tau)
+        ok2 += (g.hit == r.hit and g.face_id == r.face_id
+                and (not g.hit or g.t == r.t))
+    print(f"  第二次连续更新（移回 + 混入退化面）：与重建一致 "
+          f"{ok2}/{len(queries)}")
+    assert ok2 == len(queries)
+
+    # 失败更新：NaN 顶点被拒绝，旧树完全保持
+    pre_probe = intersect(bvh, probe_ray, 0.5)  # 第二次更新后的当前状态基准
+    bad = list(back)
+    bad[0] = Triangle.stationary((0.0, 0.0, 0.0), (math.nan, 0.0, 0.0),
+                                 (0.0, 1.0, 0.0))
+    try:
+        bvh.update_vertices(bad)
+    except ValueError as exc:
+        print(f"  [拒绝边界] 含 NaN 的更新已捕获 ValueError: {exc}")
+    else:
+        raise AssertionError("含 NaN 的更新必须被拒绝")
+    still = intersect(bvh, probe_ray, 0.5)
+    kept = (still.hit == pre_probe.hit and still.face_id == pre_probe.face_id
+            and (not still.hit or still.t == pre_probe.t))
+    print(f"  失败更新后旧树保持（查询结果不变）：{kept}")
+    assert kept
+
+    dt = time.perf_counter() - t0
+    print(f"  顶点更新演示完成，用时 {dt:.2f}s。")
+
+
 if __name__ == "__main__":
     main()
+    run_update_pass()
     run_limit_scale_pass()

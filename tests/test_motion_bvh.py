@@ -523,6 +523,337 @@ class TestStructure(unittest.TestCase):
         check(bvh._root)
 
 
+# ---------------------------------------------------------------------------
+# 顶点更新（拓扑不变、自底向上 refit）
+# ---------------------------------------------------------------------------
+
+def _leaf_faces(node):
+    if node.faces is not None:
+        return [node.faces]
+    return _leaf_faces(node.left) + _leaf_faces(node.right)
+
+
+def _assert_same_result(test, got, exp):
+    """两次查询结果（hit/face_id/t/u/v/point）完全一致；计数不作要求。"""
+    test.assertIs(got.hit, exp.hit)
+    test.assertEqual(got.face_id, exp.face_id)
+    if not got.hit:
+        return
+    # 同一三角形、同一射线、同一公式：t/u/v/point 应逐位一致
+    test.assertEqual(got.t, exp.t)
+    test.assertEqual(got.u, exp.u)
+    test.assertEqual(got.v, exp.v)
+    test.assertEqual(got.point, exp.point)
+
+
+class TestVertexUpdate(unittest.TestCase):
+    """update_vertices：拓扑不变的顶点位置更新 + 自底向上 refit。"""
+
+    def _scene(self, rng, n, motion_scale=2.0):
+        return [_rand_tri(rng, motion_scale) for _ in range(n)]
+
+    def _check_against_rebuild_and_reference(self, bvh, tris, rng, n_rays=40):
+        rebuilt = build(tris)
+        for _ in range(n_rays):
+            tau = rng.choice((0.0, 0.31, 0.5, 0.77, 1.0))
+            if rng.random() < 0.7:
+                ray = _aimed_ray(rng, tris, tau)
+            else:
+                ray = _wild_ray(rng)
+            got = intersect(bvh, ray, tau)
+            # 与全量重建一致（解析关系：refit 后查询 == 重建后查询）
+            _assert_same_result(self, got, intersect(rebuilt, ray, tau))
+            # 与独立暴力参考一致（独立期望值来源）
+            _assert_ref_agreement(self, bvh, tris, ray, tau)
+
+    def test_refit_matches_rebuild_and_reference(self):
+        rng = random.Random(20260924)
+        for n in (1, 4, 5, 40, 300):
+            tris = self._scene(rng, n)
+            bvh = build(tris)
+            new_tris = self._scene(rng, n, motion_scale=6.0)  # 全新几何
+            bvh.update_vertices(new_tris)
+            self.assertEqual(bvh.triangle_count, n)
+            self._check_against_rebuild_and_reference(bvh, new_tris, rng)
+
+    def test_module_level_entry_and_iterable_input(self):
+        rng = random.Random(31)
+        tris = self._scene(rng, 9)
+        bvh = build(tris)
+        new_tris = self._scene(rng, 9)
+        # 模块级入口 + 生成器（可迭代）输入
+        mb.update_vertices(bvh, (t for t in new_tris))
+        self._check_against_rebuild_and_reference(bvh, new_tris, rng, n_rays=20)
+
+    def test_move_across_old_box_hand_computed(self):
+        # 手算例子：三角形整体平移 +100x，远远跨出旧包围盒。
+        # 新三角形 a=(99,-1,5) b=(101,-1,5) c=(100,1,5)；射线 (100,0,0)+t(0,0,1)
+        # 交点 (100,0,5)：P-a=(1,1,0)=u(2,0,0)+v(1,2,0) → u=0.25, v=0.5, t=5。
+        tri = Triangle.stationary((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0),
+                                  (0.0, 1.0, 5.0))
+        bvh = build([tri])
+        ray_old = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray_old, 0.0).hit)
+
+        new = Triangle.stationary((99.0, -1.0, 5.0), (101.0, -1.0, 5.0),
+                                  (100.0, 1.0, 5.0))
+        bvh.update_vertices([new])
+        # 旧位置不再命中（包围盒已随 refit 搬离）
+        res_old = intersect(bvh, ray_old, 0.0)
+        self.assertFalse(res_old.hit)
+        self.assertEqual(res_old.triangles_tested, 0)  # 盒级即被排除
+        # 新位置命中，手算期望值
+        res = intersect(bvh, Ray((100.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+        self.assertTrue(res.hit)
+        self.assertAlmostEqual(res.t, 5.0, places=12)
+        self.assertAlmostEqual(res.u, 0.25, places=12)
+        self.assertAlmostEqual(res.v, 0.5, places=12)
+        self.assertAlmostEqual(res.point[0], 100.0, places=10)
+        self.assertAlmostEqual(res.point[2], 5.0, places=10)
+        _assert_ref_agreement(self, bvh, [new],
+                              Ray((100.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+
+    def test_update_motion_endpoints_changes_timeline(self):
+        # 只改 t=1 端点：τ=0 结果不变，τ=1 跟随新端点（手算）
+        tri = Triangle.stationary((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0),
+                                  (0.0, 1.0, 5.0))
+        bvh = build([tri])
+        moved = Triangle((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0),
+                         (9.0, -1.0, 5.0), (11.0, -1.0, 5.0), (10.0, 1.0, 5.0))
+        bvh.update_vertices([moved])
+        ray0 = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray0, 0.0).hit)   # τ=0 仍在原处
+        self.assertFalse(intersect(bvh, ray0, 1.0).hit)  # τ=1 已移到 x+10
+        res = intersect(bvh, Ray((10.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 1.0)
+        self.assertTrue(res.hit)
+        self.assertAlmostEqual(res.t, 5.0, places=12)
+        self.assertAlmostEqual(res.u, 0.25, places=12)
+        self.assertAlmostEqual(res.v, 0.5, places=12)
+        # τ=0.5：线性插值到 x+5
+        res = intersect(bvh, Ray((5.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.5)
+        self.assertTrue(res.hit)
+        self.assertAlmostEqual(res.point[0], 5.0, places=10)
+        _assert_ref_agreement(self, bvh, [moved],
+                              Ray((5.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.5)
+
+    def test_update_into_and_out_of_degenerate(self):
+        # 正常 → 退化（共线零面积）：不再命中；退化 → 正常：恢复命中
+        good = Triangle.stationary((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0),
+                                   (0.0, 1.0, 5.0))
+        bvh = build([good])
+        ray = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray, 0.0).hit)
+
+        degen = Triangle.stationary((-1.0, 0.0, 5.0), (0.0, 0.0, 5.0),
+                                    (1.0, 0.0, 5.0))  # 三顶点共线
+        bvh.update_vertices([degen])
+        res = intersect(bvh, ray, 0.0)
+        self.assertFalse(res.hit)
+        self.assertEqual(res.triangles_tested, 1)  # 进了叶、被 det==0 拒绝
+        _assert_ref_agreement(self, bvh, [degen], ray, 0.0)
+
+        bvh.update_vertices([good])
+        res = intersect(bvh, ray, 0.0)
+        self.assertTrue(res.hit)
+        self.assertAlmostEqual(res.t, 5.0, places=12)
+
+    def test_degenerate_only_at_some_time(self):
+        # t=0 正常、t=1 退化为共线：τ=0 命中、τ=1 不命中、中间时刻与参考一致
+        tri = Triangle((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0),
+                       (-1.0, 0.0, 5.0), (1.0, 0.0, 5.0), (0.0, 0.0, 5.0))
+        bvh = build([tri])
+        ray = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray, 0.0).hit)
+        self.assertFalse(intersect(bvh, ray, 1.0).hit)
+        for tau in (0.25, 0.5, 0.75):
+            _assert_ref_agreement(self, bvh, [tri], ray, tau)
+
+    def test_two_consecutive_updates(self):
+        rng = random.Random(20260925)
+        n = 60
+        tris0 = self._scene(rng, n)
+        bvh = build(tris0)
+        # 第一次更新：含跨旧包围盒的大位移
+        tris1 = self._scene(rng, n, motion_scale=8.0)
+        bvh.update_vertices(tris1)
+        self._check_against_rebuild_and_reference(bvh, tris1, rng, n_rays=30)
+        # 第二次更新：在第一次的树上继续（含退化面混入）
+        tris2 = self._scene(rng, n)
+        tris2[7] = Triangle.stationary((0.0, 0.0, 3.0), (0.0, 0.0, 3.0),
+                                       (0.0, 0.0, 3.0))  # 点三角形
+        bvh.update_vertices(tris2)
+        self.assertEqual(bvh.triangle_count, n)
+        self._check_against_rebuild_and_reference(bvh, tris2, rng, n_rays=30)
+
+    def test_topology_and_leaf_membership_unchanged(self):
+        rng = random.Random(13)
+        tris = self._scene(rng, 50)
+        bvh = build(tris)
+        before = _leaf_faces(bvh._root)
+        new_tris = self._scene(rng, 50, motion_scale=5.0)
+        bvh.update_vertices(new_tris)
+        # 树结构复用：叶成员（面序号集合与顺序）完全一致
+        self.assertEqual(before, _leaf_faces(bvh._root))
+        # refit 后的两端盒包含新几何（逐节点、逐端点顶点）
+        def check(node):
+            if node.faces is not None:
+                for idx in node.faces:
+                    f = bvh._faces[idx]
+                    for pi in range(6):
+                        p = f[pi]
+                        box = (node.lo0, node.hi0) if pi < 3 else (node.lo1, node.hi1)
+                        for k in range(3):
+                            self.assertGreaterEqual(p[k], box[0][k] - 1e-12)
+                            self.assertLessEqual(p[k], box[1][k] + 1e-12)
+            else:
+                # 内部节点盒 == 子节点盒并集（精确）
+                for k in range(3):
+                    self.assertEqual(node.lo0[k], min(node.left.lo0[k], node.right.lo0[k]))
+                    self.assertEqual(node.hi0[k], max(node.left.hi0[k], node.right.hi0[k]))
+                    self.assertEqual(node.lo1[k], min(node.left.lo1[k], node.right.lo1[k]))
+                    self.assertEqual(node.hi1[k], max(node.left.hi1[k], node.right.hi1[k]))
+                check(node.left)
+                check(node.right)
+        check(bvh._root)
+
+    def test_custom_face_ids_preserved(self):
+        rng = random.Random(77)
+        tris = self._scene(rng, 20)
+        ids = list(range(500, 520))
+        rng.shuffle(ids)
+        tris = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1, face_id=fid)
+                for t, fid in zip(tris, ids)]
+        bvh = build(tris)
+        # 更新时显式给出相同 face_id：合法
+        new_tris = self._scene(rng, 20)
+        new_tris = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1, face_id=fid)
+                    for t, fid in zip(new_tris, ids)]
+        bvh.update_vertices(new_tris)
+        self._check_against_rebuild_and_reference(bvh, new_tris, rng, n_rays=25)
+
+    def test_empty_bvh_update(self):
+        bvh = build([])
+        bvh.update_vertices([])  # 空对空：合法无操作
+        res = intersect(bvh, Ray((0, 0, 0), (0, 0, 1)), 0.0)
+        self.assertFalse(res.hit)
+        with self.assertRaises(ValueError):
+            bvh.update_vertices([Triangle.stationary((0, 0, 0), (1, 0, 0),
+                                                     (0, 1, 0))])
+
+
+class TestVertexUpdateValidation(unittest.TestCase):
+    """更新输入非法：明确报错且旧树完全保持（全有或全无）。"""
+
+    def _base(self):
+        # 三个静止三角形，分别位于 z=5 / z=10 / z=15，便于逐面定位查询
+        tris = [
+            Triangle.stationary((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0),
+                                (0.0, 1.0, 5.0)),
+            Triangle.stationary((-1.0, -1.0, 10.0), (1.0, -1.0, 10.0),
+                                (0.0, 1.0, 10.0)),
+            Triangle.stationary((-1.0, -1.0, 15.0), (1.0, -1.0, 15.0),
+                                (0.0, 1.0, 15.0)),
+        ]
+        return tris, build(tris)
+
+    def _probe(self, bvh):
+        # 手算：射线 (0,0,0)+t(0,0,1) 依次穿过三个面，最近命中 z=5，t=5
+        return intersect(bvh, Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+
+    def test_reject_count_mismatch(self):
+        tris, bvh = self._base()
+        with self.assertRaises(ValueError):
+            bvh.update_vertices(tris[:2])
+        with self.assertRaises(ValueError):
+            bvh.update_vertices(tris + tris[:1])
+        res = self._probe(bvh)
+        self.assertTrue(res.hit)
+        self.assertAlmostEqual(res.t, 5.0, places=12)
+
+    def test_reject_nan_infinity_and_keep_old_tree(self):
+        tris, bvh = self._base()
+        before = self._probe(bvh)
+        # 非法项放在最后：前两个合法也不得生效（全有或全无）
+        moved = [
+            Triangle.stationary((99.0, -1.0, 5.0), (101.0, -1.0, 5.0),
+                                (100.0, 1.0, 5.0)),
+            Triangle.stationary((99.0, -1.0, 10.0), (101.0, -1.0, 10.0),
+                                (100.0, 1.0, 10.0)),
+            Triangle.stationary((0.0, 0.0, 0.0), (math.nan, 0.0, 0.0),
+                                (0.0, 1.0, 0.0)),
+        ]
+        with self.assertRaises(ValueError):
+            bvh.update_vertices(moved)
+        after = self._probe(bvh)
+        _assert_same_result(self, after, before)
+        self.assertAlmostEqual(after.t, 5.0, places=12)  # 未搬去 x+100
+        for bad in (math.inf, -math.inf):
+            bad_tris = list(tris)
+            bad_tris[1] = Triangle.stationary(
+                (0.0, 0.0, bad), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+            with self.assertRaises(ValueError):
+                bvh.update_vertices(bad_tris)
+        _assert_same_result(self, self._probe(bvh), before)
+
+    def test_reject_wrong_types(self):
+        tris, bvh = self._base()
+        before = self._probe(bvh)
+        with self.assertRaises(TypeError):
+            bvh.update_vertices("not a list")
+        with self.assertRaises(TypeError):
+            bvh.update_vertices([tris[0], (0, 1, 2), tris[2]])
+        with self.assertRaises(TypeError):
+            bvh.update_vertices([tris[0], tris[1],
+                                 Triangle((0, 0), (1, 0, 0), (0, 1, 0),
+                                          (0, 0, 0), (1, 0, 0), (0, 1, 0))])
+        with self.assertRaises(TypeError):
+            bvh.update_vertices([Triangle((True, 0.0, 0.0), (1, 0, 0), (0, 1, 0),
+                                          (0, 0, 0), (1, 0, 0), (0, 1, 0))] * 3)
+        with self.assertRaises(TypeError):
+            mb.update_vertices("bvh", tris)
+        _assert_same_result(self, self._probe(bvh), before)
+
+    def test_reject_face_id_change(self):
+        tris = [Triangle.stationary((-1.0, -1.0, 5.0), (1.0, -1.0, 5.0),
+                                    (0.0, 1.0, 5.0), face_id=7),
+                Triangle.stationary((-1.0, -1.0, 10.0), (1.0, -1.0, 10.0),
+                                    (0.0, 1.0, 10.0))]  # 默认 id=1
+        bvh = build(tris)
+        before = self._probe(bvh)
+        # 显式 face_id 与现有不一致 → ValueError
+        bad = Triangle.stationary((0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                                  (0.0, 1.0, 0.0), face_id=8)
+        with self.assertRaises(ValueError):
+            bvh.update_vertices([bad, tris[1]])
+        # 负 face_id → ValueError；非 int → TypeError
+        worse = Triangle.stationary((0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                                    (0.0, 1.0, 0.0), face_id=-2)
+        with self.assertRaises(ValueError):
+            bvh.update_vertices([worse, tris[1]])
+        with self.assertRaises(TypeError):
+            bvh.update_vertices([Triangle.stationary(
+                (0, 0, 0), (1, 0, 0), (0, 1, 0), face_id=1.5), tris[1]])
+        _assert_same_result(self, self._probe(bvh), before)
+        # face_id=None 表示沿用：合法
+        bvh.update_vertices([Triangle.stationary(
+            (-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0)), tris[1]])
+        res = self._probe(bvh)
+        self.assertTrue(res.hit)
+        self.assertEqual(res.face_id, 7)  # 标识保持不变
+
+    def test_error_is_locatable(self):
+        tris, bvh = self._base()
+        bad = list(tris)
+        bad[2] = Triangle.stationary((0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                                     (0.0, math.nan, 0.0))
+        try:
+            bvh.update_vertices(bad)
+        except ValueError as exc:
+            self.assertIn("triangles[2]", str(exc))
+        else:
+            self.fail("应抛出 ValueError")
+
+
 class TestEmpty(unittest.TestCase):
     def test_empty_bvh(self):
         bvh = build([])

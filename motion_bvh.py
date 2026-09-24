@@ -8,6 +8,9 @@
     叶节点至多 4 个三角形。
   * intersect 支持 t_min/t_max、零方向分量（零向量方向非法）、同距按 face_id
     较小者胜；输出重心坐标与访问计数。
+  * update_vertices 支持拓扑不变的顶点位置全量更新：树结构（划分、叶成员、
+    face_id）不变，原地替换几何并自底向上 refit 两端包围盒；先全量校验再
+    应用，校验失败时旧树完全保持。更新后的查询结果与全量重建一致。
   * 所有数值输入拒绝 NaN/Infinity；bool 不作为整数/数值接受。
 
 本模块只依赖 Python 3.14 标准库。
@@ -26,6 +29,7 @@ __all__ = [
     "BVH",
     "build",
     "intersect",
+    "update_vertices",
 ]
 
 # ---------------------------------------------------------------------------
@@ -212,7 +216,11 @@ class _Node:
 
 
 class BVH:
-    """不可变的运动层次包围盒。请通过 motion_bvh.build 构造。"""
+    """运动层次包围盒。请通过 motion_bvh.build 构造。
+
+    构建后可重复查询；顶点位置可通过 update_vertices 做拓扑不变的原地
+    更新（树划分不变、自底向上 refit）。除 update_vertices 外对象只读。
+    """
 
     __slots__ = ("_faces", "_face_ids", "_root", "_count")
 
@@ -242,6 +250,24 @@ class BVH:
         t_max: float = math.inf,
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
+
+    def update_vertices(self, triangles: Sequence[Triangle]) -> None:
+        """拓扑不变的顶点位置全量更新（原地、自底向上 refit）。
+
+        triangles 必须是与构建时同样数量的 Triangle（允许可迭代对象），
+        按位置一一对应替换 a0..c1 六个端点顶点；树结构（SAH 划分、叶成员、
+        三角形数、face_id）不变。每个 Triangle 若显式给出 face_id，必须与
+        该位置现有 face_id 相同；为 None 表示沿用现有标识。
+
+        全有或全无：先对全部输入做与 build 相同的校验，任一非法即抛异常
+        且旧树完全保持（不留半更新状态）；校验通过后的几何替换与 refit
+        不会失败。更新后任意查询结果（hit/face_id/t/u/v/point）与用新
+        几何全量重建的 BVH 一致；遍历计数（nodes_visited/triangles_tested）
+        因划分未重算，可能与重建树不同。
+
+        注意：更新与查询不得并发执行。
+        """
+        _update_vertices(self, triangles)
 
 
 # 模块级函数也直接暴露 build/intersect 两个名字
@@ -305,6 +331,87 @@ def intersect(
 ) -> Intersection:
     """模块级入口，等价于 bvh.intersect(ray, time, t_min, t_max)。"""
     return _intersect(bvh, ray, time, t_min, t_max)
+
+
+def update_vertices(bvh: BVH, triangles: Sequence[Triangle]) -> None:
+    """模块级入口，等价于 bvh.update_vertices(triangles)。"""
+    _update_vertices(bvh, triangles)
+
+
+# ---------------------------------------------------------------------------
+# 顶点更新：拓扑不变、自底向上 refit
+# ---------------------------------------------------------------------------
+
+def _update_vertices(bvh, triangles) -> None:
+    if not isinstance(bvh, BVH):
+        raise TypeError("update_vertices 的目标必须是 motion_bvh.BVH")
+    if not isinstance(triangles, (list, tuple)):
+        # 允许可迭代对象，但先物化以便计数与定位
+        try:
+            triangles = list(triangles)
+        except TypeError as exc:
+            raise TypeError("triangles 必须是 Triangle 的可迭代对象") from exc
+    n = len(triangles)
+    # 元素类型预检（在数量校验之前，与 build 对同类输入的报错类型一致）
+    for i, tri in enumerate(triangles):
+        if not isinstance(tri, Triangle):
+            raise TypeError(
+                f"triangles[{i}] 必须是 motion_bvh.Triangle，"
+                f"得到 {type(tri).__name__}"
+            )
+    if n != bvh._count:
+        raise ValueError(
+            f"拓扑不变的更新要求三角形数不变：现有 {bvh._count} 个，得到 {n} 个"
+        )
+
+    # 第一阶段：全量校验并物化新几何（与 build 同一套校验）。
+    # 此阶段抛任何异常都不会触碰旧树。
+    new_faces = []
+    for i, tri in enumerate(triangles):
+        where = f"triangles[{i}]"
+        a0 = _check_point(tri.a0, f"{where}.a0")
+        b0 = _check_point(tri.b0, f"{where}.b0")
+        c0 = _check_point(tri.c0, f"{where}.c0")
+        a1 = _check_point(tri.a1, f"{where}.a1")
+        b1 = _check_point(tri.b1, f"{where}.b1")
+        c1 = _check_point(tri.c1, f"{where}.c1")
+        if tri.face_id is not None:
+            fid = _check_int(tri.face_id, f"{where}.face_id")
+            if fid < 0:
+                raise ValueError(f"{where}.face_id 必须非负，得到 {fid}")
+            if fid != bvh._face_ids[i]:
+                raise ValueError(
+                    f"{where}.face_id={fid} 与该位置现有标识 "
+                    f"{bvh._face_ids[i]} 不一致（拓扑不变的更新不得改变 face_id）"
+                )
+        new_faces.append((a0, b0, c0, a1, b1, c1))
+
+    # 第二阶段：应用。几何已全为有限实数，替换与 refit 均为纯浮点选取
+    # （min/max），不会失败，因此不会留下半更新状态。
+    bvh._faces = new_faces
+    if bvh._root is not None:
+        _refit(bvh._root, new_faces)
+
+
+def _refit(node, faces) -> None:
+    """自底向上重拟合两端包围盒与护栏量。
+
+    叶节点由其成员三角形的新几何重算两端 AABB；内部节点取两子节点盒的
+    并集。min/max 是精确选取，分组顺序不影响结果，故内部节点盒与构建期
+    逐面合并完全一致。
+    """
+    node.lo0 = node.hi0 = node.lo1 = node.hi1 = None
+    if node.faces is not None:
+        for idx in node.faces:
+            b0, b1 = _face_endpoint_boxes(faces[idx])
+            _merge_node_boxes(node, b0, b1)
+    else:
+        _refit(node.left, faces)
+        _refit(node.right, faces)
+        for child in (node.left, node.right):
+            _merge_node_boxes(
+                node, (child.lo0, child.hi0), (child.lo1, child.hi1))
+    node.g_eps = _node_guard(node)
 
 
 # ---------------------------------------------------------------------------

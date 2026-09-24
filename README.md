@@ -14,28 +14,33 @@
 ## 快速验证
 
 ```bash
-python -m unittest discover -s tests -v   # 41 个测试，约 0.2s
-python demo.py                            # 固定输入演示，约 0.3s，要求 <8s
+python -m unittest discover -s tests -v   # 56 个测试，约 0.4s
+python demo.py                            # 固定输入演示，约 0.4s，要求 <90s
 ```
 
 demo 真实计算并打印：
 1. 一个正常命中结果（face_id、t、barycentric、point）；
 2. 12 条射线 BVH 与独立暴力参考逐条一致，且 BVH 明显少测面；
-3. 一个 300 面（接口上限规模）场景 ×240 条射线的批量比对；
-4. 一个**实际触发的拒绝边界**：零方向射线抛出 `ValueError`。
+3. **顶点更新**：拓扑不变更新 + 自底向上 refit，跨旧包围盒平移后与
+   全量重建逐位一致、与暴力参考一致；连续两次更新；含 NaN 的失败更新
+   被拒绝且旧树保持；
+4. 一个 300 面（接口上限规模）场景 ×240 条射线的批量比对；
+5. 一个**实际触发的拒绝边界**：零方向射线抛出 `ValueError`。
 无 `sleep`、无预录结果。
 
 ## 公开接口
 
 ```python
-from motion_bvh import Triangle, Ray, build, intersect
+from motion_bvh import Triangle, Ray, build, intersect, update_vertices
 
 tri = Triangle(a0, b0, c0, a1, b1, c1, face_id=None)
 tri = Triangle.stationary(a, b, c, face_id=None)   # 静止三角形语法糖
 ray = Ray(origin=(x,y,z), direction=(dx,dy,dz))
-bvh = build(triangles)                 # -> BVH（构建后只读、可重复查询）
+bvh = build(triangles)                 # -> BVH（可重复查询、可拓扑不变更新）
 hit = intersect(bvh, ray, time, t_min=0.0, t_max=math.inf)
 hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
+bvh.update_vertices(new_triangles)     # 原地更新顶点位置（见下节）
+update_vertices(bvh, new_triangles)    # 等价的模块级入口
 ```
 
 ### 数据结构
@@ -60,6 +65,27 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   `triangles_tested` 为实际做三角形求交的面数。
 - 空场景（`build([])` 合法）：任何查询未命中，计数为 0。
 
+### 顶点位置更新（拓扑不变）
+
+`bvh.update_vertices(new_triangles)` 在**同一棵树**上替换全部三角形的
+顶点位置（a0..c1 六个端点），并**自底向上 refit** 两端包围盒：叶节点由
+新几何重算，内部节点取子节点盒并集（min/max 为精确选取，与构建期逐面
+合并结果一致）。规则：
+
+- **拓扑不变**：三角形数必须与原树相同（不一致抛 `ValueError`）；
+  SAH 划分、叶成员、face_id 均不变。每个 `Triangle` 若显式给出
+  `face_id`，必须与该位置现有标识相同（否则 `ValueError`）；
+  `face_id=None` 表示沿用现有标识。
+- **全有或全无**：先对全部输入做与 `build` 相同的校验（NaN/Infinity、
+  bool、类型、形状、face_id），任一非法即抛异常且**旧树完全保持**
+  （不留半更新状态）；校验通过后的几何替换与 refit 不会失败。
+- **结果等价**：更新后任意查询的 hit/face_id/t/u/v/point 与用新几何
+  `build` 全量重建的 BVH **逐位一致**（同一获胜面、同一求交公式）；
+  遍历计数 `nodes_visited`/`triangles_tested` 因划分未重算，可能与
+  重建树不同。
+- 更新是**原地**修改（返回 `None`）；更新与查询不得并发执行。
+- 空 BVH 允许 `update_vertices([])`（无操作）。
+
 ### 输入上限（接口边界）
 
 - 三角形数 **1 ≤ N ≤ 300**（0 个也合法，表示空场景）；超出抛 `ValueError`。
@@ -78,6 +104,7 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   `ValueError`。错误消息带可定位前缀，如 `triangles[12].b0[2] ...`、
   `ray.direction 不能为零向量`。
 - **全有或全无**：`build` 先全量校验再构建，非法输入不会产生部分对象；
+  `update_vertices` 同样先全量校验再应用，失败时旧树完全保持；
   `intersect` 为只读查询，不修改 BVH。
 - **搜索预算**：本实现**没有**遍历预算/迭代上限这一概念——遍历必然终止，
   “未命中”始终是**已证明无解**（盒层次全部测试完），不存在“预算耗尽但
@@ -113,6 +140,9 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   **中分 n//2**，保证确定性、两侧非空且叶 ≤ 4。
 - **运动界**：节点不存“扫掠体凸包”，而是存两端 AABB；查询时插值并外扩，
   对线性顶点运动保守（线性插值的顶点 min/max 被端点 min/max 包含）。
+- **顶点更新（refit）**：拓扑不变时无需重构——叶盒由新几何重算，内部
+  节点自底向上取子盒并集；min/max 是精确选取，refit 后的盒与构建期
+  逐面合并逐位一致，因此查询结果与全量重建一致。
 - **遍历**：显式栈（无递归深度风险），先压右后压左；命中后用当前最近
   距离（加同距带）收窄盒窗口；为不漏同距面，剪枝窗口含 tie 带宽。
 - **决胜与顺序解耦**：先求严格最小 t 再在同距带内选最小 face_id，
@@ -126,8 +156,11 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 - SAH 成本只使用 t=0 几何，**不做运动感知划分**；高速运动场景的剪枝效率
   可能次优，但结果正确性对任意 τ 成立。
 - 仅支持本文件定义的三角形网格输入与单射线查询；无 Mesh/Material、
-  无批量/流式 API、无动态重拟合（refit）、无并行/SIMD 优化。
-- 构建后的 BVH 不可变；多线程并发只读查询是安全的，构建本身未做并发设计。
+  无批量/流式 API、无并行/SIMD 优化。
+- `update_vertices` 只重算包围盒（refit），**不重新做 SAH 划分**：大幅
+  运动后剪枝效率可能下降，但结果正确性不受影响（与全量重建一致）。
+- 除 `update_vertices` 外 BVH 只读；多线程并发只读查询是安全的，
+  但更新与查询不得并发，构建/更新本身未做并发设计。
 - 完全共面/重合的两个面：几何距离相同即按 face_id 决胜，不做摄动消歧。
 - `direction` 不归一化：返回的 t 以 direction 长度为单位。
 - 坐标量级建议在普通 binary64 稳健范围内（约 1e6 以内）；未针对极端
@@ -136,10 +169,10 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 ## 文件
 
 ```
-motion_bvh.py             # 本题核心模块（build/intersect、公开数据结构）
+motion_bvh.py             # 本题核心模块（build/intersect/update_vertices、公开数据结构）
 tests/__init__.py         # 测试包标识
 tests/reference.py        # 独立暴力参考（逐三角形直接求交，用于期望值）
-tests/test_motion_bvh.py  # 必要测试（41 个）
+tests/test_motion_bvh.py  # 必要测试（56 个）
 demo.py                   # 固定输入演示
 README.md
 ```
