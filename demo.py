@@ -21,7 +21,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import motion_bvh as mb
-from motion_bvh import Triangle, Ray, build, intersect
+from motion_bvh import Triangle, Ray, build, intersect, update
 from tests.reference import reference_intersect
 
 
@@ -195,6 +195,114 @@ def run_limit_scale_pass():
           f"用时 {dt:.2f}s。")
 
 
+def run_refit_pass():
+    """拓扑保持的顶点更新（refit）演示：正常结果 + 退化边界 + 实际错误。
+
+    场景全部按手算位置构造：两排各 6 个静止等腰三角形分居 z=±10，
+    第 i 个上排三角形中心 x=i−2.5（i=0..5）。更新后整体平移 +x 30，
+    新盒完全离开旧盒；期望值同时用“全量 build 重建”和独立暴力参考核对。
+    """
+    print("\n==================== 顶点更新（refit）演示 ====================")
+
+    def row(z):
+        out = []
+        for i in range(6):
+            cx = i - 2.5
+            out.append(Triangle.stationary(
+                (cx - 0.4, -1.0, z), (cx + 0.4, -1.0, z), (cx, 1.0, z)))
+        return out
+
+    tris = row(10.0) + row(-10.0)
+    bvh = build(tris)
+
+    # ---- 正常结果：跨旧包围盒平移，查询与全量重建一致 -------------------
+    dx = 30.0
+    moved = []
+    for t in tris:
+        shifted = []
+        for k in range(6):
+            p = getattr(t, ("a0 b0 c0 a1 b1 c1".split())[k])
+            shifted.append((p[0] + dx, p[1], p[2]))
+        moved.append(Triangle(*shifted))
+    update(bvh, moved)
+    rebuilt = build(moved)  # 题面基准：同样输入全量重建
+
+    ray_old = Ray((0.5, 0.0, 0.0), (0.0, 0.0, 1.0))   # 瞄准旧位置
+    ray_new = Ray((30.5, 0.0, 0.0), (0.0, 0.0, 1.0))  # 瞄准新位置
+    miss = intersect(bvh, ray_old, 0.0)
+    hit = intersect(bvh, ray_new, 0.0)
+    fresh = intersect(rebuilt, ray_new, 0.0)
+    ref = reference_intersect(moved, ray_new, 0.0)
+    print("[正常] 12 面整体平移 +x30（新盒全部离开旧盒），自底向上 refit 完成")
+    print(f"  旧位置射线：命中={miss.hit}，测面 {miss.triangles_tested}"
+          f"（根盒已移走，直接剪枝，手算应为 0）")
+    print(f"  新位置射线：命中 face={hit.face_id} t={hit.t:.6f}"
+          f"（手算：上排第 3 面 id=3、t=10），测面 {hit.triangles_tested}/12")
+    print(f"  与全量重建一致：{hit.face_id == fresh.face_id and hit.t == fresh.t}"
+          f"；与暴力参考一致：{hit.face_id == ref['face_id']}")
+
+    # ---- 连续第二次更新：上排静止 -> 沿 z 线性运动，下排保持原位；
+    #      τ=0.5 上排 z=15 是射线最近命中，手算 t=15 ----------------------
+    moving = []
+    for i, t in enumerate(moved):
+        z1 = 20.0 if i < 6 else -10.0  # 仅上排运动，下排静止在起点后方
+        moving.append(Triangle(
+            t.a0, t.b0, t.c0,
+            (t.a0[0], t.a0[1], z1), (t.b0[0], t.b0[1], z1),
+            (t.c0[0], t.c0[1], z1)))
+    update(bvh, moving)  # 第二次连续更新
+    r = Ray((30.5, 0.0, 0.0), (0.0, 0.0, 1.0))
+    h0, h1, hh = (intersect(bvh, r, tau) for tau in (0.0, 1.0, 0.5))
+    print(f"[连续两次更新] 第二次改为 z 向运动：τ=0 t={h0.t:.1f}、"
+          f"τ=1 t={h1.t:.1f}、τ=0.5 t={hh.t:.1f}（手算 10/20/15）")
+    print(f"  τ=0.5 暴力参考 t={reference_intersect(moving, r, 0.5)['t']:.1f}，"
+          f"一致={abs(hh.t - 15.0) < 1e-9}")
+
+    # ---- 边界：更新引入退化（零面积）三角形，行为正确 -------------------
+    deg = [
+        Triangle.stationary(
+            (-1.0, -1.0, 4.0), (1.0, -1.0, 4.0), (0.0, 1.0, 4.0)),
+        # 共线退化面（更新前是正常面，这里用两棵树直接对照）
+        Triangle.stationary(
+            (-2.0, 0.0, 7.0), (0.0, 0.0, 7.0), (2.0, 0.0, 7.0)),
+    ]
+    dbvh = build([Triangle.stationary((9, 9, 9), (9, 9, 9), (9, 9, 9)),
+                  Triangle.stationary((8, 8, 8), (8, 8, 8), (8, 8, 8))])
+    update(dbvh, deg)
+    # (1.5,0) 在正常三角形 x∈[-1,1] 之外，但在共线线段 x∈[-2,2] 上：
+    # 退化面不得产生命中
+    through_seg = Ray((1.5, 0.0, 0.0), (0.0, 0.0, 1.0))
+    through_tri = Ray((0.0, 0.3, 0.0), (0.0, 0.0, 1.0))   # 穿过正常面
+    m1 = intersect(dbvh, through_seg, 0.0)
+    m2 = intersect(dbvh, through_tri, 0.0)
+    r1 = reference_intersect(deg, through_seg, 0.0)
+    r2 = reference_intersect(deg, through_tri, 0.0)
+    print(f"[边界] 更新后第 2 面为共线退化三角形：穿过它 命中={m1.hit}"
+          f"（参考 {r1['hit']}）；正常面仍命中 face={m2.face_id}"
+          f" t={m2.t:.1f}（参考 face={r2['face_id']} t={r2['t']:.1f}）")
+
+    # ---- 实际错误：非法更新被拒绝且旧树完整保留 --------------------------
+    old_hit = intersect(bvh, r, 0.5)
+    bad = list(moving)
+    bad[0] = Triangle((math.nan, 0.0, 0.0), bad[0].b0, bad[0].c0,
+                      bad[0].a1, bad[0].b1, bad[0].c1)
+    print("[错误] 用含 NaN 的新位置更新（预期 ValueError）：")
+    try:
+        update(bvh, bad)
+    except (ValueError, TypeError) as exc:
+        print(f"  已捕获 {type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("含 NaN 的更新必须被拒绝")
+    try:
+        update(bvh, moving[:-1])  # 数量不符（拓扑不变被破坏）
+    except ValueError as exc:
+        print(f"  已捕获 {type(exc).__name__}: {exc}")
+    kept = intersect(bvh, r, 0.5)
+    print(f"  失败后旧树保留：同射线仍命中 face={kept.face_id} "
+          f"t={kept.t:.1f}，与失败前一致={(kept.face_id, kept.t) == (old_hit.face_id, old_hit.t)}")
+
+
 if __name__ == "__main__":
     main()
+    run_refit_pass()
     run_limit_scale_pass()

@@ -3,6 +3,9 @@
 契约概览（详见 README.md）：
   * build(triangles) -> BVH；每三角形给出 t=0 与 t=1 两端顶点，顶点在 t∈[0,1]
     线性运动。最多 300 个三角形。
+  * update(bvh, triangles)：拓扑保持的顶点位置更新；面数/顺序/face_id 必须与
+    build 时一致，沿用同一层树自底向上 refit 两端 AABB。先全量校验并在影子
+    节点上重算，成功后才提交——失败时旧树完全保留。
   * BVH 节点保存 t=0/t=1 两端 AABB；遍历时刻 τ 对包围盒线性插值（保守外包）。
   * 构建使用参考时刻 t=0 质心、固定 8 桶 SAH；质心退化时使用稳定中分；
     叶节点至多 4 个三角形。
@@ -25,6 +28,7 @@ __all__ = [
     "Intersection",
     "BVH",
     "build",
+    "update",
     "intersect",
 ]
 
@@ -212,7 +216,11 @@ class _Node:
 
 
 class BVH:
-    """不可变的运动层次包围盒。请通过 motion_bvh.build 构造。"""
+    """运动层次包围盒。请通过 motion_bvh.build 构造。
+
+    拓扑（划分结构、面序、face_id）构建后固定；顶点位置可用
+    motion_bvh.update 整体替换（自底向上 refit，见 README）。
+    """
 
     __slots__ = ("_faces", "_face_ids", "_root", "_count")
 
@@ -243,14 +251,20 @@ class BVH:
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
 
+    # ---- 公开更新入口 -----------------------------------------------------
+
+    def update(self, triangles: Sequence[Triangle]) -> None:
+        """拓扑保持的顶点位置更新，等价于模块级 update(self, triangles)。"""
+        _update(self, triangles)
+
 
 # 模块级函数也直接暴露 build/intersect 两个名字
 
-def build(triangles: Sequence[Triangle]) -> BVH:
-    """由运动三角形列表构建 BVH。
+def _validate_faces(triangles, expected_count: Optional[int] = None):
+    """物化并全量校验三角形列表；返回 (geoms, face_ids)。
 
-    全量校验通过后才构建：非法输入时不会产生任何对象（全有或全无）。
-    空列表合法，得到空 BVH（任意查询均未命中）。
+    build 与 update 共用同一套校验（错误语义一致）。expected_count 非 None
+    时要求数量恰好相等（update 的拓扑不变契约）。
     """
     if not isinstance(triangles, (list, tuple)):
         # 允许可迭代对象，但先物化以便计数与定位
@@ -259,9 +273,10 @@ def build(triangles: Sequence[Triangle]) -> BVH:
         except TypeError as exc:
             raise TypeError("triangles 必须是 Triangle 的可迭代对象") from exc
     n = len(triangles)
-    if n > MAX_TRIANGLES:
+    if expected_count is not None and n != expected_count:
         raise ValueError(
-            f"三角形数 {n} 超过上限 {MAX_TRIANGLES}（接口边界，非性能建议）"
+            f"update 要求三角形数与 build 时一致（拓扑不变）："
+            f"期望 {expected_count}，得到 {n}"
         )
 
     faces = []
@@ -289,11 +304,90 @@ def build(triangles: Sequence[Triangle]) -> BVH:
         seen_ids.add(fid)
         faces.append((a0, b0, c0, a1, b1, c1, fid))
 
-    # 校验全部通过，开始构建（不会再失败）
     geoms = [entry[:6] for entry in faces]
     face_ids = [entry[6] for entry in faces]
+    return geoms, face_ids
+
+
+def build(triangles: Sequence[Triangle]) -> BVH:
+    """由运动三角形列表构建 BVH。
+
+    全量校验通过后才构建：非法输入时不会产生任何对象（全有或全无）。
+    空列表合法，得到空 BVH（任意查询均未命中）。
+    """
+    if not isinstance(triangles, (list, tuple)):
+        # 允许可迭代对象，但先物化以便计数与定位
+        try:
+            triangles = list(triangles)
+        except TypeError as exc:
+            raise TypeError("triangles 必须是 Triangle 的可迭代对象") from exc
+    n = len(triangles)
+    if n > MAX_TRIANGLES:
+        raise ValueError(
+            f"三角形数 {n} 超过上限 {MAX_TRIANGLES}（接口边界，非性能建议）"
+        )
+
+    # 校验全部通过，开始构建（不会再失败）
+    geoms, face_ids = _validate_faces(triangles)
     root = _build(geoms, list(range(n))) if n else None
     return BVH._from_root(geoms, face_ids, root, n)
+
+
+def update(bvh: BVH, triangles: Sequence[Triangle]) -> None:
+    """拓扑保持的顶点位置更新（自底向上 refit），就地生效，返回 None。
+
+    契约：
+      * 三角形数量、顺序与 build 时一致；第 i 个新三角形替换第 i 个旧三角形
+        的全部 6 个端点位置（两端运动一并替换）。
+      * face_id 语义与 build 相同（缺省取输入下标），且更新后必须与现有
+        face_id 序列完全一致——拓扑不变意味着面标识不变。
+      * 校验与 build 同一套（NaN/Infinity、bool、类型/形状、重复 face_id 等）。
+
+    全有或全无：先全量校验，再在全新分配的影子节点上自底向上重算两端
+    AABB，全部成功后才一次性提交；任何一步失败旧树完全保留，可继续查询。
+    更新后的查询结果与用新几何全量 build 的结果一致（见 README 与测试）。
+    """
+    _update(bvh, triangles)
+
+
+def _update(bvh: BVH, triangles: Sequence[Triangle]) -> None:
+    if not isinstance(bvh, BVH):
+        raise TypeError("update 的目标必须是 motion_bvh.BVH")
+    geoms, face_ids = _validate_faces(triangles, expected_count=bvh._count)
+    if face_ids != bvh._face_ids:
+        raise ValueError(
+            "update 要求 face_id 序列与 build 时完全一致（拓扑不变）；"
+            "如需改变面标识请重新 build"
+        )
+    root = bvh._root
+    if root is None:
+        return  # 空场景：无树可 refit，几何替换无意义，直接成功返回
+    # 在影子节点上自底向上重算；此阶段不触碰旧树，任何异常都不会留下半更新
+    new_root = _refit(root, geoms)
+    # 提交：几何与根一次性替换（面序与 face_id 不变，无需替换 _face_ids）
+    bvh._faces = geoms
+    bvh._root = new_root
+
+
+def _refit(old: _Node, geoms) -> _Node:
+    """按旧树拓扑在全新节点上重算两端 AABB（自底向上），返回新子树根。"""
+    node = _Node()
+    if old.faces is not None:
+        node.faces = old.faces  # 叶划分（拓扑）原样保留，仅重算包围盒
+        for idx in old.faces:
+            b0, b1 = _face_endpoint_boxes(geoms[idx])
+            _merge_node_boxes(node, b0, b1)
+    else:
+        node.left = _refit(old.left, geoms)
+        node.right = _refit(old.right, geoms)
+        for child in (node.left, node.right):
+            _merge_node_boxes(
+                node,
+                (child.lo0, child.hi0),
+                (child.lo1, child.hi1),
+            )
+    node.g_eps = _node_guard(node)
+    return node
 
 
 def intersect(

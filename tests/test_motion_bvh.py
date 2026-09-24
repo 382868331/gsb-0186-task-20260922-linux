@@ -20,7 +20,7 @@ for _p in (HERE, ROOT):
         sys.path.insert(0, _p)
 
 import motion_bvh as mb
-from motion_bvh import Triangle, Ray, build, intersect
+from motion_bvh import Triangle, Ray, build, intersect, update
 from reference import reference_intersect
 
 
@@ -675,6 +675,401 @@ class TestValidation(unittest.TestCase):
     def test_bvh_not_directly_constructible(self):
         with self.assertRaises(TypeError):
             mb.BVH()
+
+
+class TestUpdate(unittest.TestCase):
+    """拓扑保持的顶点位置更新（自底向上 refit）。"""
+
+    # ---- 手算例子：跨旧包围盒移动 ---------------------------------------
+
+    def test_hand_computed_translation_across_old_box(self):
+        # 初始静止三角形，中心 (0,0)，平面 z=5
+        tri0 = Triangle.stationary(
+            (-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0))
+        bvh = build([tri0])
+        ray_x0 = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray_x0, 0.0).hit)
+
+        # 更新：整体平移到 x=10（新盒完全离开旧盒 [−1,1]）
+        tri1 = Triangle.stationary(
+            (9.0, -1.0, 5.0), (11.0, -1.0, 5.0), (10.0, 1.0, 5.0))
+        self.assertIsNone(update(bvh, [tri1]))  # 就地生效、返回 None
+        self.assertEqual(bvh.triangle_count, 1)
+
+        # 白盒手算：两端盒都恰为 x[9,11] y[-1,1] z[5,5]
+        root = bvh._root
+        self.assertEqual(root.lo0, (9.0, -1.0, 5.0))
+        self.assertEqual(root.hi0, (11.0, 1.0, 5.0))
+        self.assertEqual(root.lo1, (9.0, -1.0, 5.0))
+        self.assertEqual(root.hi1, (11.0, 1.0, 5.0))
+
+        # 旧位置射线：盒已移走，根节点处即被剪枝（0 次测面），证明盒真的移动了
+        gone = intersect(bvh, ray_x0, 0.0)
+        self.assertFalse(gone.hit)
+        self.assertEqual(gone.triangles_tested, 0)
+
+        # 新位置射线命中，(10,0) 是 b、c 边中点 => u=v=0.5，手算
+        hit = intersect(bvh, Ray((10.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+        self.assertTrue(hit.hit)
+        self.assertAlmostEqual(hit.t, 5.0, places=12)
+        # 手算：P=(0,0)=(1-u-v)(-1,-1)+u(1,-1)+v(0,1) => v=0.5, u=0.25
+        self.assertAlmostEqual(hit.u, 0.25, places=12)
+        self.assertAlmostEqual(hit.v, 0.5, places=12)
+        _assert_ref_agreement(
+            self, bvh, [tri1], Ray((10.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+
+    def test_hand_computed_stationary_to_moving(self):
+        # 第二次更新：静止 -> 运动，t=0 在 x=10，t=1 在 x=20
+        tri0 = Triangle.stationary(
+            (-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0))
+        bvh = build([tri0])
+        update(bvh, [Triangle.stationary(
+            (9.0, -1.0, 5.0), (11.0, -1.0, 5.0), (10.0, 1.0, 5.0))])
+        moving = Triangle(
+            (9.0, -1.0, 5.0), (11.0, -1.0, 5.0), (10.0, 1.0, 5.0),
+            (19.0, -1.0, 5.0), (21.0, -1.0, 5.0), (20.0, 1.0, 5.0))
+        update(bvh, [moving])  # 连续两次更新后的状态
+        # 白盒手算端点盒
+        self.assertEqual(bvh._root.lo0, (9.0, -1.0, 5.0))
+        self.assertEqual(bvh._root.hi0, (11.0, 1.0, 5.0))
+        self.assertEqual(bvh._root.lo1, (19.0, -1.0, 5.0))
+        self.assertEqual(bvh._root.hi1, (21.0, 1.0, 5.0))
+        # τ=0.5 中心 x=15：x=15 命中（u=v=0.5），x=10 未命中
+        hit = intersect(bvh, Ray((15.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.5)
+        self.assertTrue(hit.hit)
+        # 同形三角形质心轴点：v=0.5，x 方向 -1+2u+v=0 => u=0.25
+        self.assertAlmostEqual(hit.u, 0.25, places=10)
+        self.assertAlmostEqual(hit.v, 0.5, places=10)
+        self.assertFalse(
+            intersect(bvh, Ray((10.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.5).hit)
+        # τ=1 精确取新端点：x=20
+        self.assertTrue(
+            intersect(bvh, Ray((20.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 1.0).hit)
+        _assert_ref_agreement(
+            self, bvh, [moving],
+            Ray((15.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.5)
+
+    # ---- 与全量重建一致（随机场景，含跨旧盒的大位移） -------------------
+
+    def _tree_sig(self, node):
+        if node.faces is not None:
+            return ("leaf", node.faces)
+        return ("node", self._tree_sig(node.left), self._tree_sig(node.right))
+
+    def _box_dump(self, node):
+        return (node.lo0, node.hi0, node.lo1, node.hi1,
+                None if node.faces is not None
+                else (self._box_dump(node.left), self._box_dump(node.right)))
+
+    def test_refit_matches_full_rebuild_and_keeps_topology(self):
+        rng = random.Random(20260924)
+        for scene, n in enumerate((1, 2, 5, 13, 64, 300)):
+            old = [_rand_tri(rng) for _ in range(n)]
+            bvh = build(old)
+            sig_before = self._tree_sig(bvh._root)
+            # 新几何：位移尺度放大到 12，必然整体跨出旧包围盒
+            new = [_rand_tri(rng, motion_scale=12.0) for _ in range(n)]
+            update(bvh, new)
+            # 拓扑（叶划分）逐节点保持
+            self.assertEqual(self._tree_sig(bvh._root), sig_before,
+                             f"scene {scene} 更新后拓扑发生变化")
+            rebuilt = build(new)  # 题面基准：全量重建
+            for _ in range(30 if n < 300 else 20):
+                tau = rng.choice((0.0, 0.31, 0.5, 0.78, 1.0))
+                if rng.random() < 0.7:
+                    ray = _aimed_ray(rng, new, tau)
+                else:
+                    ray = _wild_ray(rng)
+                got = intersect(bvh, ray, tau)
+                fresh = intersect(rebuilt, ray, tau)
+                _assert_ref_agreement(self, bvh, new, ray, tau)
+                # 与全量重建逐条一致
+                self.assertIs(got.hit, fresh.hit)
+                if got.hit:
+                    self.assertEqual(got.face_id, fresh.face_id)
+                    self.assertLessEqual(
+                        abs(got.t - fresh.t),
+                        1e-12 * max(1.0, abs(got.t), abs(fresh.t)))
+                    self.assertLessEqual(abs(got.u - fresh.u), 1e-12)
+                    self.assertLessEqual(abs(got.v - fresh.v), 1e-12)
+
+    def test_two_consecutive_updates(self):
+        rng = random.Random(555)
+        n = 40
+        g0 = [_rand_tri(rng) for _ in range(n)]
+        g1 = [_rand_tri(rng, motion_scale=8.0) for _ in range(n)]
+        g2 = [_rand_tri(rng, motion_scale=8.0) for _ in range(n)]
+        bvh = build(g0)
+        sig = self._tree_sig(bvh._root)
+        update(bvh, g1)
+        update(bvh, g2)  # 连续第二次更新
+        self.assertEqual(self._tree_sig(bvh._root), sig)
+        rebuilt = build(g2)
+        for _ in range(60):
+            tau = rng.choice((0.0, 0.5, 1.0))
+            ray = _aimed_ray(rng, g2, tau) if rng.random() < 0.8 else _wild_ray(rng)
+            got, fresh = intersect(bvh, ray, tau), intersect(rebuilt, ray, tau)
+            self.assertIs(got.hit, fresh.hit)
+            if got.hit:
+                self.assertEqual(got.face_id, fresh.face_id)
+                self.assertLessEqual(
+                    abs(got.t - fresh.t), 1e-12 * max(1.0, abs(got.t)))
+            _assert_ref_agreement(self, bvh, g2, ray, tau)
+
+    def test_clusters_swap_sides_across_old_boxes(self):
+        # 两簇分居 z=±20；更新后两簇整体互换（每个面跨过旧盒）。
+        def cluster(z):
+            return [Triangle.stationary(
+                (i * 0.5, 0.0, z), (i * 0.5 + 0.4, 0.0, z),
+                (i * 0.5 + 0.2, 1.0, z)) for i in range(8)]
+        top, bottom = cluster(20.0), cluster(-20.0)
+        old = top + bottom
+        bvh = build(old)
+        ray = Ray((3.2, 0.3333, 0.0), (0.0, 0.0, 1.0))
+        self.assertTrue(intersect(bvh, ray, 0.0).hit)
+        # 逐面平移到对侧：面序不变，但每个面的新盒完全离开其旧盒
+        moved = []
+        for t in old:
+            dz = -40.0 if t.a0[2] > 0 else 40.0
+            moved.append(Triangle(
+                (t.a0[0], t.a0[1], t.a0[2] + dz),
+                (t.b0[0], t.b0[1], t.b0[2] + dz),
+                (t.c0[0], t.c0[1], t.c0[2] + dz),
+                (t.a1[0], t.a1[1], t.a1[2] + dz),
+                (t.b1[0], t.b1[1], t.b1[2] + dz),
+                (t.c1[0], t.c1[1], t.c1[2] + dz)))
+        update(bvh, moved)
+        rebuilt = build(moved)
+        for x in (0.2, 1.7, 3.2):
+            r = Ray((x, 0.3333, 0.0), (0.0, 0.0, 1.0))
+            got, fresh = intersect(bvh, r, 0.0), intersect(rebuilt, r, 0.0)
+            self.assertIs(got.hit, fresh.hit)
+            if got.hit:
+                self.assertEqual(got.face_id, fresh.face_id)
+            _assert_ref_agreement(self, bvh, moved, r, 0.0)
+        # 原来的 +z 簇现在在 -z：反向射线才能命中
+        self.assertTrue(
+            intersect(bvh, Ray((3.2, 0.3333, 0.0), (0.0, 0.0, -1.0)), 0.0).hit)
+
+    # ---- 退化三角形 ------------------------------------------------------
+
+    def test_degenerate_geometry_survives_refit(self):
+        # 初始：一个正常面 + 一个点面
+        normal0 = Triangle.stationary(
+            (-1.0, -1.0, 5.0), (1.0, -1.0, 5.0), (0.0, 1.0, 5.0))
+        point0 = Triangle.stationary((5.0, 5.0, 5.0), (5.0, 5.0, 5.0),
+                                     (5.0, 5.0, 5.0))
+        bvh = build([normal0, point0])
+        # 更新：正常面变共线（退化），点面变正常面（盒由零厚度长大）
+        seg = Triangle.stationary(
+            (-2.0, 0.0, 3.0), (0.0, 0.0, 3.0), (2.0, 0.0, 3.0))
+        grown = Triangle.stationary(
+            (4.0, -1.0, 5.0), (6.0, -1.0, 5.0), (5.0, 1.0, 5.0))
+        update(bvh, [seg, grown])
+        new = [seg, grown]
+        # 退化盒手算：seg 盒 y=z=3 退化为平面；grown 盒正常
+        # 穿过共线“面”的射线不命中
+        r = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertFalse(intersect(bvh, r, 0.0).hit)
+        _assert_ref_agreement(self, bvh, new, r, 0.0)
+        # 长大的面可命中（u=v=0.5 手算），证明其盒已正确外扩
+        hit = intersect(bvh, Ray((5.0, 0.0, 0.0), (0.0, 0.0, 1.0)), 0.0)
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.face_id, 1)
+        # 同形三角形：v=0.5，u=0.25（同上手算）
+        self.assertAlmostEqual(hit.u, 0.25, places=10)
+        self.assertAlmostEqual(hit.v, 0.5, places=10)
+        # 端点时刻退化、中间时刻仍退化的运动点/线段
+        move_deg = Triangle(
+            (0.0, 0.0, 4.0), (1.0, 0.0, 4.0), (2.0, 0.0, 4.0),
+            (0.0, 2.0, 6.0), (1.0, 2.0, 6.0), (2.0, 2.0, 6.0))
+        bvh2 = build([move_deg])
+        update(bvh2, [move_deg])
+        for tau in (0.0, 0.5, 1.0):
+            rr = Ray((0.5, 1.0, 0.0), (0.0, 0.0, 1.0))
+            self.assertFalse(intersect(bvh2, rr, tau).hit)
+            _assert_ref_agreement(self, bvh2, [move_deg], rr, tau)
+
+    def test_degenerate_mixed_fuzz_after_update(self):
+        rng = random.Random(31337)
+        n = 24
+        new = [_rand_tri(rng) for _ in range(n)]
+        new.append(Triangle.stationary((0, 0, 5), (0, 0, 5), (0, 0, 5)))
+        new.append(Triangle.stationary((-3.0, -3.0, 2.0),
+                                       (3.0, -3.0, 2.0), (0.0, 3.0, 2.0)))
+        old = [_rand_tri(rng) for _ in range(n + 2)]
+        bvh = build(old)
+        update(bvh, new)
+        rebuilt = build(new)
+        for tau in (0.0, 0.5, 1.0):
+            for _ in range(25):
+                ray = _aimed_ray(rng, new, tau)
+                self.assertIs(intersect(bvh, ray, tau).hit,
+                              intersect(rebuilt, ray, tau).hit)
+                _assert_ref_agreement(self, bvh, new, ray, tau)
+
+    # ---- face_id 与入口等价 ----------------------------------------------
+
+    def test_custom_face_ids_preserved_and_tiebreak(self):
+        # 两个共面三角形 id=5/id=2；更新后仍共面，同距决胜必须仍是较小 id
+        def pair(z):
+            return [
+                Triangle((-2.0, -2.0, z), (2.0, -2.0, z), (0.0, 2.0, z),
+                         (-2.0, -2.0, z), (2.0, -2.0, z), (0.0, 2.0, z),
+                         face_id=5),
+                Triangle((-2.0, 2.0, z), (2.0, 2.0, z), (0.0, -2.0, z),
+                         (-2.0, 2.0, z), (2.0, 2.0, z), (0.0, -2.0, z),
+                         face_id=2),
+            ]
+        bvh = build(pair(1.0))
+        ray = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        self.assertEqual(intersect(bvh, ray, 0.0).face_id, 2)
+        update(bvh, pair(4.0))
+        hit = intersect(bvh, ray, 0.0)
+        self.assertTrue(hit.hit)
+        self.assertEqual(hit.face_id, 2)
+        self.assertAlmostEqual(hit.t, 4.0, places=10)
+        _assert_ref_agreement(self, bvh, pair(4.0), ray, 0.0)
+
+    def test_method_and_module_entry_equivalent(self):
+        rng = random.Random(808)
+        g0 = [_rand_tri(rng) for _ in range(20)]
+        g1 = [_rand_tri(rng) for _ in range(20)]
+        b1, b2 = build(list(g0)), build(list(g0))
+        b1.update(g1)
+        update(b2, [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in g1])
+        for _ in range(30):
+            tau = rng.choice((0.0, 0.5, 1.0))
+            ray = _wild_ray(rng)
+            r1, r2 = intersect(b1, ray, tau), intersect(b2, ray, tau)
+            self.assertIs(r1.hit, r2.hit)
+            if r1.hit:
+                self.assertEqual(r1.face_id, r2.face_id)
+                self.assertEqual(r1.t, r2.t)
+
+    # ---- 空场景 -----------------------------------------------------------
+
+    def test_update_empty_bvh(self):
+        bvh = build([])
+        self.assertIsNone(update(bvh, []))  # 空 -> 空合法
+        res = intersect(bvh, Ray((0, 0, 0), (0, 0, 1)), 0.0)
+        self.assertFalse(res.hit)
+        self.assertEqual(res.nodes_visited, 0)
+        with self.assertRaises(ValueError):
+            update(bvh, [Triangle.stationary(
+                (0, 0, 0), (1, 0, 0), (0, 1, 0))])
+        # 失败后仍是空树
+        self.assertEqual(bvh.triangle_count, 0)
+        self.assertFalse(
+            intersect(bvh, Ray((0, 0, 0), (0, 0, 1)), 0.0).hit)
+
+    # ---- 失败路径：不留半更新状态 ----------------------------------------
+
+    def _state_snapshot(self, bvh, rays):
+        return (
+            id(bvh._root),
+            None if bvh._root is None else self._box_dump(bvh._root),
+            [(lambda r: (r.hit, r.face_id, r.t, r.u, r.v,
+                         r.triangles_tested))(intersect(bvh, ray, tau))
+             for ray, tau in rays],
+        )
+
+    def test_failed_update_keeps_old_tree(self):
+        rng = random.Random(2025)
+        n = 30
+        good = [_rand_tri(rng) for _ in range(n)]
+        bvh = build(good)
+        probe_rng = random.Random(777)
+        rays = []
+        for _ in range(12):
+            tau = probe_rng.choice((0.0, 0.5, 1.0))
+            rays.append((_aimed_ray(probe_rng, good, tau), tau))
+        before = self._state_snapshot(bvh, rays)
+
+        def expect_fail(bad, exc):
+            with self.assertRaises(exc):
+                update(bvh, bad)
+            after = self._state_snapshot(bvh, rays)
+            self.assertEqual(after, before, "失败的 update 不得改动旧树")
+
+        ok = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in good]
+        # 数值非法
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[7] = Triangle(bad[7].a0, (math.nan, 0.0, 0.0), bad[7].c0,
+                          bad[7].a1, bad[7].b1, bad[7].c1)
+        expect_fail(bad, ValueError)
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[3] = Triangle(bad[3].a0, bad[3].b0,
+                          (math.inf, 1.0, 0.0),
+                          bad[3].a1, bad[3].b1, bad[3].c1)
+        expect_fail(bad, ValueError)
+        # bool / 类型 / 形状
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[1] = Triangle((True, 0.0, 0.0), bad[1].b0, bad[1].c0,
+                          bad[1].a1, bad[1].b1, bad[1].c1)
+        expect_fail(bad, TypeError)
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[1] = Triangle("x", bad[1].b0, bad[1].c0,
+                          bad[1].a1, bad[1].b1, bad[1].c1)
+        expect_fail(bad, TypeError)
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[1] = Triangle((0.0, 0.0), bad[1].b0, bad[1].c0,
+                          bad[1].a1, bad[1].b1, bad[1].c1)
+        expect_fail(bad, TypeError)
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in ok]
+        bad[5] = (0, 1, 2)
+        expect_fail(bad, TypeError)
+        expect_fail(12345, TypeError)
+        # 数量不符（拓扑不变）
+        expect_fail(ok[:-1], ValueError)
+        expect_fail(ok + [ok[0]], ValueError)
+        # face_id 问题
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1, face_id=i)
+               for i, t in enumerate(ok)]
+        bad2 = list(bad)
+        bad2[0] = Triangle(bad[0].a0, bad[0].b0, bad[0].c0,
+                           bad[0].a1, bad[0].b1, bad[0].c1, face_id=999)
+        expect_fail(bad2, ValueError)
+        bad2 = list(bad)
+        bad2[1] = Triangle(bad[1].a0, bad[1].b0, bad[1].c0,
+                           bad[1].a1, bad[1].b1, bad[1].c1, face_id=0)
+        expect_fail(bad2, ValueError)  # 与 face_id=0 重复
+        bad2 = list(bad)
+        bad2[2] = Triangle(bad[2].a0, bad[2].b0, bad[2].c0,
+                           bad[2].a1, bad[2].b1, bad[2].c1, face_id=-3)
+        expect_fail(bad2, ValueError)
+        # 缺省 id 的树喂入显式置换 id -> 与现有面序 id 不一致
+        perm = list(range(n))
+        perm[0], perm[1] = perm[1], perm[0]
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1, face_id=fid)
+               for t, fid in zip(ok, perm)]
+        expect_fail(bad, ValueError)
+
+    def test_update_rejects_non_bvh(self):
+        tri = Triangle.stationary((0, 0, 0), (1, 0, 0), (0, 1, 0))
+        with self.assertRaises(TypeError):
+            update("not a bvh", [tri])
+
+    def test_failed_update_then_successful_update(self):
+        # 一次失败之后，树不仅可查询，还能继续成功更新
+        rng = random.Random(909)
+        g0 = [_rand_tri(rng) for _ in range(15)]
+        g1 = [_rand_tri(rng, motion_scale=6.0) for _ in range(15)]
+        bvh = build(g0)
+        bad = [Triangle(t.a0, t.b0, t.c0, t.a1, t.b1, t.c1) for t in g1]
+        bad[0] = Triangle((math.nan, 0.0, 0.0), bad[0].b0, bad[0].c0,
+                          bad[0].a1, bad[0].b1, bad[0].c1)
+        with self.assertRaises(ValueError):
+            update(bvh, bad)
+        update(bvh, g1)
+        rebuilt = build(g1)
+        for _ in range(30):
+            tau = rng.choice((0.0, 0.5, 1.0))
+            ray = _aimed_ray(rng, g1, tau)
+            got, fresh = intersect(bvh, ray, tau), intersect(rebuilt, ray, tau)
+            self.assertIs(got.hit, fresh.hit)
+            if got.hit:
+                self.assertEqual(got.face_id, fresh.face_id)
 
 
 if __name__ == "__main__":

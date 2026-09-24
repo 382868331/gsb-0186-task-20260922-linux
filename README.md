@@ -11,32 +11,60 @@
 线性运动 `p(τ)=p0+τ·(p1−p0)`。BVH 每个节点保存 **两端 AABB**，查询时对
 包围盒端点线性插值（并做保守外扩），再以 Slab 法做射线-盒相交。
 
+除构建/查询外，模块支持**拓扑保持的顶点位置更新** `update`：面数、顺序、
+face_id 不变，沿用同一层树自底向上 refit 两端 AABB；更新后的查询与用新
+几何全量 `build` 的结果一致，非法更新整体失败且旧树完整保留。
+
 ## 快速验证
 
 ```bash
-python -m unittest discover -s tests -v   # 41 个测试，约 0.2s
-python demo.py                            # 固定输入演示，约 0.3s，要求 <8s
+python -m unittest discover -s tests -v   # 54 个测试，约 0.3s
+python demo.py                            # 固定输入演示，约 0.3s，要求 <90s
 ```
 
 demo 真实计算并打印：
 1. 一个正常命中结果（face_id、t、barycentric、point）；
 2. 12 条射线 BVH 与独立暴力参考逐条一致，且 BVH 明显少测面；
-3. 一个 300 面（接口上限规模）场景 ×240 条射线的批量比对；
-4. 一个**实际触发的拒绝边界**：零方向射线抛出 `ValueError`。
+3. **顶点更新（refit）段落**：跨旧包围盒平移、连续两次更新、退化三角形
+   边界、以及非法更新被拒绝且旧树保留的真实错误；
+4. 一个 300 面（接口上限规模）场景 ×240 条射线的批量比对；
+5. 一个**实际触发的拒绝边界**：零方向射线抛出 `ValueError`。
 无 `sleep`、无预录结果。
 
 ## 公开接口
 
 ```python
-from motion_bvh import Triangle, Ray, build, intersect
+from motion_bvh import Triangle, Ray, build, update, intersect
 
 tri = Triangle(a0, b0, c0, a1, b1, c1, face_id=None)
 tri = Triangle.stationary(a, b, c, face_id=None)   # 静止三角形语法糖
 ray = Ray(origin=(x,y,z), direction=(dx,dy,dz))
-bvh = build(triangles)                 # -> BVH（构建后只读、可重复查询）
+bvh = build(triangles)                 # -> BVH（拓扑构建后固定）
+update(bvh, triangles)                 # 拓扑保持的顶点更新（就地，返回 None）
+bvh.update(triangles)                  # 等价
 hit = intersect(bvh, ray, time, t_min=0.0, t_max=math.inf)
 hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 ```
+
+### 顶点位置更新（refit）契约
+
+- **拓扑不变**：新列表的三角形数量、顺序与 `build` 时完全一致；第 i 个新
+  三角形替换第 i 个旧三角形的全部 6 个端点（两端运动一并替换）。
+- **face_id 不变**：更新后 face_id 序列必须与现有树逐位一致（显式 id
+  原样给；缺省 id 的树继续用缺省下标）。需要增删面、重排面或改 face_id
+  时请重新 `build`——这些不是“拓扑不变”的更新。
+- 校验规则与 `build` 完全相同（NaN/Infinity、bool、类型/形状、负/重复
+  face_id、数量不符等），错误消息同样带 `triangles[i].字段` 定位前缀。
+- **全有或全无**：先全量校验，再在全新分配的影子节点上自底向上重算两端
+  AABB 与护栏，全部成功后才一次性替换；更新期间任何异常都不会留下半更新
+  状态，旧树可立即继续查询，也可在失败后再次尝试更新。
+- **结果一致性**：refit 只重算节点盒、不改划分；对任意射线/时刻，更新后
+  的命中结果与用同一批新三角形全量 `build` 的结果一致（测试以 ≤1e-12
+  逐条核对，并同时对照独立暴力参考）。
+- 允许把正常面更新为退化（点/共线）三角形，或反向把退化盒“长大”；
+  退化面在任意 τ 仍不产生命中。空 BVH（`build([])`）只能以空列表更新。
+- refit **不重新划分**：若顶点长期大幅漂移导致簇重叠，剪枝效率可能劣化
+  （正确性不变）；本迭代不提供自动重建触发策略。
 
 ### 数据结构
 
@@ -78,7 +106,8 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   `ValueError`。错误消息带可定位前缀，如 `triangles[12].b0[2] ...`、
   `ray.direction 不能为零向量`。
 - **全有或全无**：`build` 先全量校验再构建，非法输入不会产生部分对象；
-  `intersect` 为只读查询，不修改 BVH。
+  `update` 先全量校验、再在影子节点上 refit，提交是一次性的，失败时旧树
+  完整保留；`intersect` 为只读查询，不修改 BVH。
 - **搜索预算**：本实现**没有**遍历预算/迭代上限这一概念——遍历必然终止，
   “未命中”始终是**已证明无解**（盒层次全部测试完），不存在“预算耗尽但
   未知是否有解”的第三种结果；`Intersection` 只有命中/未命中两态。
@@ -117,6 +146,11 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   距离（加同距带）收窄盒窗口；为不漏同距面，剪枝窗口含 tie 带宽。
 - **决胜与顺序解耦**：先求严格最小 t 再在同距带内选最小 face_id，
   BVH 与暴力参考（任意顺序）结果一致（开发期 10800 组随机差分 0 不一致）。
+- **拓扑保持更新（refit）**：`update` 不触碰任何 `faces`/left/right 引用，
+  按旧树在影子节点上自底向上把每个叶盒重算为新端点顶点的精确 min/max，
+  内部节点盒取两子盒并集，护栏 `g_eps` 按新盒尺度重算；提交时一次性替换
+  `_faces` 与根节点。因此盒包含关系、谓词保守性与构建路径完全同构，
+  正确性不依赖“位移不大”这一假设，跨旧盒移动同样成立。
 - **独立参考**：`tests/reference.py` 独立抄写一份求交与决胜逻辑，
   **不 import、不调用被测核心的任何算法**来取期望值；“往返一致”
   只作为测试中的补充断言。
@@ -126,8 +160,11 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 - SAH 成本只使用 t=0 几何，**不做运动感知划分**；高速运动场景的剪枝效率
   可能次优，但结果正确性对任意 τ 成立。
 - 仅支持本文件定义的三角形网格输入与单射线查询；无 Mesh/Material、
-  无批量/流式 API、无动态重拟合（refit）、无并行/SIMD 优化。
-- 构建后的 BVH 不可变；多线程并发只读查询是安全的，构建本身未做并发设计。
+  无批量/流式 API、无实例两级树/整段运动界、无并行/SIMD 优化。
+- `update` 仅做拓扑保持的 refit：不增删/重排面、不重新划分、不提供
+  “低效即自动重建”的触发策略；需要这些时由调用方重新 `build`。
+- 更新是就地的读-改-写：多线程并发只读查询安全，但 `update` 与并发查询
+  的同步由调用方负责（本迭代不含版本化的并发读）。
 - 完全共面/重合的两个面：几何距离相同即按 face_id 决胜，不做摄动消歧。
 - `direction` 不归一化：返回的 t 以 direction 长度为单位。
 - 坐标量级建议在普通 binary64 稳健范围内（约 1e6 以内）；未针对极端
@@ -136,10 +173,10 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 ## 文件
 
 ```
-motion_bvh.py             # 本题核心模块（build/intersect、公开数据结构）
+motion_bvh.py             # 本题核心模块（build/update/intersect、公开数据结构）
 tests/__init__.py         # 测试包标识
 tests/reference.py        # 独立暴力参考（逐三角形直接求交，用于期望值）
-tests/test_motion_bvh.py  # 必要测试（41 个）
-demo.py                   # 固定输入演示
+tests/test_motion_bvh.py  # 必要测试（54 个）
+demo.py                   # 固定输入演示（含 refit 段）
 README.md
 ```
