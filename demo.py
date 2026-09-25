@@ -21,8 +21,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import motion_bvh as mb
-from motion_bvh import Triangle, Ray, build, intersect
-from tests.reference import reference_intersect
+from motion_bvh import Triangle, Ray, ShadowRay, build, intersect, packet_occluded
+from tests.reference import reference_intersect, reference_occluded
 
 
 def make_scene(n_per_cluster=28, seed=20260922):
@@ -144,6 +144,73 @@ def main():
     print(f"\n演示完成，实际耗时 {dt:.2f}s（无 sleep、无预录结果）。")
 
 
+def run_packet_pass():
+    """packet_occluded 共享节点调度演示：成束遮挡射线 + 半开边界 + 批量拒绝。"""
+    t0 = time.perf_counter()
+    # 两堵 z=±20 的三角形墙（72 面）
+    tris = []
+    for z in (20.0, -20.0):
+        for i in range(36):
+            gx = (i % 6) * 1.1 - 2.75
+            gy = (i // 6) * 1.1 - 2.75
+            s = 0.5
+            tris.append(Triangle.stationary(
+                (gx - s, gy - s, z), (gx + s, gy - s, z), (gx, gy + s, z)))
+    bvh = build(tris)
+
+    rng = random.Random(20260925)
+    # 32 条同向成束阴影射线（z 向 +z 墙，带小抖动）
+    rays = [ShadowRay((rng.uniform(-0.4, 0.4), rng.uniform(-0.4, 0.4), 0.0),
+                      (rng.uniform(-0.05, 0.05), rng.uniform(-0.05, 0.05), 1.0))
+            for _ in range(32)]
+    res = packet_occluded(bvh, rays)
+    solo = [packet_occluded(bvh, [sr]) for sr in rays]
+    sum_nodes = sum(s.nodes_scheduled for s in solo)
+    ok = all(res.occluded[i]
+             == reference_occluded(tris, rays[i].origin, rays[i].direction, 0.0)
+             for i in range(32))
+    print("\n[packet_occluded] 32 条同向成束阴影射线，z=±20 双墙（72 面）：")
+    print(f"  被挡住 {sum(res.occluded)}/32；与逐面独立参考布尔结果一致：{ok}")
+    print(f"  共享调度节点数 {res.nodes_scheduled} vs 逐条遍历之和 {sum_nodes}"
+          f"（仅 {res.nodes_scheduled / sum_nodes:.0%}，"
+          f"少调度 {sum_nodes - res.nodes_scheduled} 次）")
+    print(f"  射线盒测试 {res.box_tests}（= 逐条之和 "
+          f"{sum(s.box_tests for s in solo)}），射线三角形测试 "
+          f"{res.triangle_tests}（= 逐条之和 "
+          f"{sum(s.triangle_tests for s in solo)}）：谓词工作量完全相同，"
+          f"省的是节点调度。")
+
+    # 正常路径的一条明细：忽略近面后被远面挡住 + t_max 接触不算遮挡
+    tri_n = Triangle.stationary((-2, -2, 2), (2, -2, 2), (0, 2, 2), face_id=1)
+    tri_f = Triangle.stationary((-2, -2, 8), (2, -2, 8), (0, 2, 8), face_id=2)
+    bvh2 = build([tri_n, tri_f])
+    detail = [
+        ShadowRay((0, 0, 0), (0, 0, 1)),                          # 近面挡
+        ShadowRay((0, 0, 0), (0, 0, 1), ignore_faces={1}),        # 忽略近面→远面挡
+        ShadowRay((0, 0, 0), (0, 0, 1), t_max=2.0),               # 恰触近面(t==t_max)
+    ]
+    r2 = packet_occluded(bvh2, detail)
+    print("\n[正常路径明细] 近面 z=2、远面 z=8，射线沿 +z：")
+    print(f"  默认            -> occluded={r2.occluded[0]}（近面挡）")
+    print(f"  ignore 近面     -> occluded={r2.occluded[1]}"
+          f"（忽略集合只属本射线，远面挡）")
+    print(f"  t_max=2 半开    -> occluded={r2.occluded[2]}"
+          f"（t==t_max 接触不算遮挡）")
+
+    # ---- packet 的实际拒绝边界：任一非法整批拒绝 ------------------------
+    print("\n[packet 拒绝边界] 第 3 条射线零方向，整批拒绝（无部分结果）：")
+    try:
+        packet_occluded(bvh2, [detail[0], detail[0],
+                               ShadowRay((0, 0, 0), (0, 0, 0))])
+    except (ValueError, TypeError) as exc:
+        print(f"  已捕获 {type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("含非法射线的 packet 必须整批拒绝")
+
+    dt = time.perf_counter() - t0
+    print(f"\npacket 演示完成，实际耗时 {dt:.2f}s。")
+
+
 def run_limit_scale_pass():
     """接口上限规模（300 面）真实计算：批量射线与暴力参考逐条比对。"""
     t0 = time.perf_counter()
@@ -198,3 +265,4 @@ def run_limit_scale_pass():
 if __name__ == "__main__":
     main()
     run_limit_scale_pass()
+    run_packet_pass()

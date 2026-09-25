@@ -8,6 +8,10 @@
     叶节点至多 4 个三角形。
   * intersect 支持 t_min/t_max、零方向分量（零向量方向非法）、同距按 face_id
     较小者胜；输出重心坐标与访问计数。
+  * packet_occluded 一次接收 1..64 条阴影射线（ShadowRay：各自的半开 t 区间
+    [t_min, t_max)、time 与 ignore_faces），整批共享一次节点调度：每个节点
+    携带仍需检查的射线位掩码，包围盒按各射线自己的 time 插值；每条只回答
+    “是否被挡住”，命中即退出该射线后续所有节点；任一射线非法则整批拒绝。
   * 所有数值输入拒绝 NaN/Infinity；bool 不作为整数/数值接受。
 
 本模块只依赖 Python 3.14 标准库。
@@ -23,9 +27,12 @@ __all__ = [
     "Triangle",
     "Ray",
     "Intersection",
+    "ShadowRay",
+    "OcclusionResult",
     "BVH",
     "build",
     "intersect",
+    "packet_occluded",
 ]
 
 # ---------------------------------------------------------------------------
@@ -34,6 +41,9 @@ __all__ = [
 
 MAX_TRIANGLES = 300
 """build 接受的三角形数上限。"""
+
+MAX_PACKET = 64
+"""packet_occluded 单批接受的阴影射线数上限。"""
 
 LEAF_SIZE = 4
 """叶节点三角形数上限。"""
@@ -194,6 +204,46 @@ class Intersection:
         return self.hit
 
 
+@dataclass(frozen=True, slots=True)
+class ShadowRay:
+    """一条阴影（遮挡）射线：只问“在 [t_min, t_max) 内是否被任何面挡住”。
+
+    origin/direction 同 Ray（direction 允许零分量、不许零向量）；
+    time 为该射线自己的插值时刻（每条可不同）；
+    t_min/t_max 构成**半开**区间：t==t_min 的接触算遮挡，**t==t_max 的接触
+    不算遮挡**（与 intersect 的双闭区间刻意不同）；
+    ignore_faces 为该射线专属的忽略面 face_id 集合，只对本条射线生效，
+    接受 tuple/list/set/frozenset（内部复制为 frozenset，不持有外部可变对象）。
+    """
+
+    origin: tuple
+    direction: tuple
+    time: float = 0.0
+    t_min: float = 0.0
+    t_max: float = math.inf
+    ignore_faces: Optional[Sequence] = None
+
+
+@dataclass(frozen=True, slots=True)
+class OcclusionResult:
+    """整批遮挡查询结果（按输入位置一一对应）。
+
+    occluded          逐射线布尔：True=被挡住
+    rejection         逐射线拒绝原因；成功为 None（整体非法时不返回本对象）
+    nodes_scheduled   共享遍历的节点调度次数（一个节点被调度入栈计一次，
+                      含根；整批共享，不是逐条之和）
+    box_tests         射线×节点盒测试总次数（每条射线每个仍需检查且命中
+                      该节点的盒计一次）
+    triangle_tests    射线×三角形测试总次数
+    """
+
+    occluded: tuple
+    rejection: tuple
+    nodes_scheduled: int
+    box_tests: int
+    triangle_tests: int
+
+
 # ---------------------------------------------------------------------------
 # BVH 内部结构
 # ---------------------------------------------------------------------------
@@ -242,6 +292,9 @@ class BVH:
         t_max: float = math.inf,
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
+
+    def packet_occluded(self, rays: Sequence[ShadowRay]) -> OcclusionResult:
+        return _packet_occluded(self, rays)
 
 
 # 模块级函数也直接暴露 build/intersect 两个名字
@@ -305,6 +358,11 @@ def intersect(
 ) -> Intersection:
     """模块级入口，等价于 bvh.intersect(ray, time, t_min, t_max)。"""
     return _intersect(bvh, ray, time, t_min, t_max)
+
+
+def packet_occluded(bvh: BVH, rays: Sequence[ShadowRay]) -> OcclusionResult:
+    """模块级入口，等价于 bvh.packet_occluded(rays)。"""
+    return _packet_occluded(bvh, rays)
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +767,233 @@ def _triangle_hit(face, o, d, tau, t_min, t_max):
     if t < t_min or t > t_max:
         return None
     # 边界吸收：仅在 _BARY_EPS 内夹到 [0,1]
+    if u < 0.0:
+        u = 0.0
+    elif u > 1.0:
+        u = 1.0
+    if v < 0.0:
+        v = 0.0
+    if u + v > 1.0:
+        v = 1.0 - u
+    return t, u, v
+
+
+# ---------------------------------------------------------------------------
+# 批量遮挡（阴影射线包）：共享节点调度的位掩码遍历
+# ---------------------------------------------------------------------------
+
+def _validate_shadow_ray(sr, i: int, known_ids: set):
+    """校验第 i 条 ShadowRay，返回遍历用的紧凑元组；非法即带位置抛错。
+
+    整批查询在任何遍历开始前先逐条调用本函数（全有或全无）。
+    """
+    where = f"rays[{i}]"
+    if not isinstance(sr, ShadowRay):
+        raise TypeError(
+            f"{where} 必须是 motion_bvh.ShadowRay，得到 {type(sr).__name__}"
+        )
+    tau = _check_real(sr.time, f"{where}.time")
+    if not (_TIME_LO <= tau <= _TIME_HI):
+        raise ValueError(
+            f"{where}.time 必须在 [{_TIME_LO}, {_TIME_HI}] 内，得到 {tau}"
+        )
+    t0 = _check_real(sr.t_min, f"{where}.t_min")
+    if not _is_real(sr.t_max):
+        raise TypeError(
+            f"{where}.t_max 必须是实数(int/float)，得到 {type(sr.t_max).__name__}"
+        )
+    t1 = float(sr.t_max)
+    if math.isnan(t1):
+        raise ValueError(f"{where}.t_max 不能是 NaN")
+    if math.isinf(t1) and t1 < 0.0:
+        raise ValueError(f"{where}.t_max 不能是 -Infinity")
+    if t0 > t1:
+        raise ValueError(f"{where}.t_min({t0}) 不能大于 t_max({t1})")
+    origin = _check_point(sr.origin, f"{where}.origin")
+    if not isinstance(sr.direction, (tuple, list)) or len(sr.direction) != 3:
+        raise TypeError(f"{where}.direction 必须是长度为 3 的序列")
+    direction = _check_point(sr.direction, f"{where}.direction")
+    if direction == (0.0, 0.0, 0.0):
+        raise ValueError(f"{where}.direction 不能为零向量")
+
+    ig_raw = sr.ignore_faces
+    if ig_raw is None:
+        ignore = frozenset()
+    else:
+        if not isinstance(ig_raw, (tuple, list, set, frozenset)):
+            raise TypeError(
+                f"{where}.ignore_faces 必须是 tuple/list/set/frozenset，"
+                f"得到 {type(ig_raw).__name__}"
+            )
+        ignore = set()
+        for j, fid in enumerate(ig_raw):
+            x = _check_int(fid, f"{where}.ignore_faces[{j}]")
+            if x < 0:
+                raise ValueError(
+                    f"{where}.ignore_faces[{j}] 必须非负，得到 {x}"
+                )
+            if x not in known_ids:
+                raise ValueError(
+                    f"{where}.ignore_faces[{j}]={x} 不是本 BVH 中存在的 face_id"
+                )
+            ignore.add(x)
+        ignore = frozenset(ignore)
+    return (origin, direction, tau, t0, t1, ignore)
+
+
+def _packet_occluded(bvh: BVH, rays) -> OcclusionResult:
+    if not isinstance(bvh, BVH):
+        raise TypeError("packet 查询目标必须是 motion_bvh.BVH")
+    if not isinstance(rays, (list, tuple)):
+        try:
+            rays = list(rays)
+        except TypeError as exc:
+            raise TypeError("rays 必须是 ShadowRay 的可迭代对象") from exc
+    n = len(rays)
+    if n < 1 or n > MAX_PACKET:
+        raise ValueError(
+            f"每批射线数必须在 1..{MAX_PACKET} 之间（接口边界），得到 {n}"
+        )
+
+    # ---- 全量校验先于一切遍历：任一非法整批拒绝（全有或全无）----------
+    known_ids = set(bvh._face_ids)
+    parsed = [_validate_shadow_ray(sr, i, known_ids) for i, sr in enumerate(rays)]
+
+    occluded = [False] * n
+    no_reject = (None,) * n
+    root = bvh._root
+    if root is None or root.lo0 is None:
+        return OcclusionResult(tuple(occluded), no_reject, 0, 0, 0)
+
+    # ---- 共享调度遍历 ---------------------------------------------------
+    # active：尚未找到遮挡面、仍需继续检查的 lane 位掩码。每条 lane 找到
+    # 第一个有效面后立即从 active 清除——它后续节点全部退出，其余 lane 继续。
+    # 栈帧 (node, mask)：mask 是该节点入栈时仍存活、且命中父节点盒的
+    # lane 集合（“节点携带仍需检查的射线位掩码”）。lane 可能在帧入栈后、
+    # 出栈前于另一分支命中，故出栈先与 active 求交清除失效位；绝不用
+    # “本节点盒未命中”去清除其他分支上的同一条 lane。
+    active = (1 << n) - 1
+    stack = [(root, active)]
+    nodes_scheduled = 0
+    box_tests = 0
+    triangle_tests = 0
+
+    while stack:
+        node, frame_mask = stack.pop()
+        mask = frame_mask & active
+        if not mask:
+            # 该帧携带的 lane 在它排队期间已全部在别处命中：无需派发。
+            continue
+        nodes_scheduled += 1
+
+        # 逐 lane 盒测试，包围盒按该 lane 自己的 τ 插值。
+        hit_mask = 0
+        bits = mask
+        while bits:
+            lb = bits & -bits
+            lane = lb.bit_length() - 1
+            box_tests += 1
+            o, d, tau, t0, t1, _ign = parsed[lane]
+            if _box_hit_half(node, o, d, tau, t0, t1):
+                hit_mask |= lb
+            bits ^= lb
+        if not hit_mask:
+            continue
+
+        if node.faces is not None:
+            for idx in node.faces:
+                if not hit_mask:
+                    break
+                fid = bvh._face_ids[idx]
+                face = bvh._faces[idx]
+                bits = hit_mask
+                while bits:
+                    lb = bits & -bits
+                    lane = lb.bit_length() - 1
+                    bits ^= lb
+                    ignore = parsed[lane][5]
+                    if fid in ignore:
+                        # 忽略集合只对所属 lane 生效；被忽略的面不做求交。
+                        continue
+                    triangle_tests += 1
+                    o, d, tau, t0, t1, _ign = parsed[lane]
+                    if _triangle_hit_half(face, o, d, tau, t0, t1) is not None:
+                        occluded[lane] = True
+                        active ^= lb
+                        hit_mask ^= lb
+        else:
+            # 两个子节点各自独立携带“命中父盒”的完整 hit_mask：某条 lane
+            # 未命中左子盒只会在左子内部被剔除，右子的帧里该位仍保留，
+            # 分支掩码不求交错杀。左子先弹出（与单射线遍历同序）。
+            stack.append((node.right, hit_mask))
+            stack.append((node.left, hit_mask))
+
+    return OcclusionResult(
+        tuple(occluded), no_reject, nodes_scheduled, box_tests, triangle_tests
+    )
+
+
+def _box_hit_half(node, o, d, tau, t_min, t_max) -> bool:
+    """Slab 法射线-AABB 的**半开区间**版本：射线段为 [t_min, t_max)。
+
+    与 _box_hit 相同的插值/护栏与零分量处理，仅最终重叠判定改为
+    “与 [t_min, t_max) 有交集”：tfar >= t_min 且 tnear < t_max
+    （恰在 t_max 接触不算进入包围盒）。
+    """
+    lo0, hi0, lo1, hi1 = node.lo0, node.hi0, node.lo1, node.hi1
+    tnear, tfar = t_min, t_max
+    for k in range(3):
+        lo = lo0[k] + tau * (lo1[k] - lo0[k])
+        hi = hi0[k] + tau * (hi1[k] - hi0[k])
+        guard = node.g_eps + _BOX_GUARD_ULPS * _EPS * max(1.0, abs(lo), abs(hi))
+        lo -= guard
+        hi += guard
+        dk = d[k]
+        if dk == 0.0:
+            if o[k] < lo or o[k] > hi:
+                return False
+            continue
+        t1 = (lo - o[k]) / dk
+        t2 = (hi - o[k]) / dk
+        if t1 < t2:
+            tn, tf = t1, t2
+        else:
+            tn, tf = t2, t1
+        if tn > tnear:
+            tnear = tn
+        if tf < tfar:
+            tfar = tf
+        if tnear > tfar:
+            return False
+    return tfar >= t_min and tnear < t_max
+
+
+def _triangle_hit_half(face, o, d, tau, t_min, t_max):
+    """半开 [t_min, t_max) 区间的 Möller–Trumbore；返回 (t,u,v) 或 None。
+
+    与 _triangle_hit 唯一差异：t == t_max 的接触不算命中（t == t_min 算）。
+    """
+    a = _vlerp(face[0], face[3], tau)
+    b = _vlerp(face[1], face[4], tau)
+    c = _vlerp(face[2], face[5], tau)
+    e1 = _vsub(b, a)
+    e2 = _vsub(c, a)
+    pvec = _vcross(d, e2)
+    det = _vdot(e1, pvec)
+    if det == 0.0:
+        return None
+    inv_det = 1.0 / det
+    tvec = _vsub(o, a)
+    u = _vdot(tvec, pvec) * inv_det
+    if u < -_BARY_EPS or u > 1.0 + _BARY_EPS:
+        return None
+    qvec = _vcross(tvec, e1)
+    v = _vdot(d, qvec) * inv_det
+    if v < -_BARY_EPS or u + v > 1.0 + _BARY_EPS:
+        return None
+    t = _vdot(e2, qvec) * inv_det
+    if t < t_min or t >= t_max:
+        return None
     if u < 0.0:
         u = 0.0
     elif u > 1.0:
