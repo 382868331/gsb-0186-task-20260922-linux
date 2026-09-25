@@ -119,3 +119,24 @@ def _tri_by_id(triangles, fid):
         if (tr.face_id if tr.face_id is not None else j) == fid:
             return tr
     raise LookupError(f"reference 内部错误：找不到 face_id={fid}")
+
+
+def reference_occluded(triangles, ray, time, t_min=0.0, t_max=math.inf,
+                       ignore_faces=frozenset()):
+    """独立逐面遮挡 oracle：任一未被该射线忽略的面在半开区间
+    [t_min, t_max) 内命中即视为遮挡（t==t_max 的接触不算）。
+
+    不调用 motion_bvh 的任何算法；与 packet_occluded 的布尔契约独立对应。
+    """
+    o = tuple(ray.origin)
+    d = tuple(ray.direction)
+    tau = float(time)
+    ignored = set(ignore_faces) if ignore_faces else set()
+    for i, tri in enumerate(triangles):
+        fid = i if tri.face_id is None else tri.face_id
+        if fid in ignored:
+            continue
+        r = _tri_intersect(tri, o, d, tau, t_min, t_max)
+        if r is not None and r[0] < t_max:
+            return True
+    return False

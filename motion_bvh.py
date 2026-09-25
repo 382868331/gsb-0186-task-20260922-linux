@@ -8,6 +8,9 @@
     叶节点至多 4 个三角形。
   * intersect 支持 t_min/t_max、零方向分量（零向量方向非法）、同距按 face_id
     较小者胜；输出重心坐标与访问计数。
+  * packet_occluded 一次处理最多 64 条遮挡射线：每条有独立的半开 t 区间
+    [t_min, t_max)、time 与 ignore_faces；整批共享节点调度（节点携带仍需
+    检查的射线位掩码，盒按各射线自己的 time 插值），只回答“是否被挡住”。
   * 所有数值输入拒绝 NaN/Infinity；bool 不作为整数/数值接受。
 
 本模块只依赖 Python 3.14 标准库。
@@ -23,9 +26,12 @@ __all__ = [
     "Triangle",
     "Ray",
     "Intersection",
+    "OcclusionQuery",
+    "OcclusionPacket",
     "BVH",
     "build",
     "intersect",
+    "packet_occluded",
 ]
 
 # ---------------------------------------------------------------------------
@@ -34,6 +40,9 @@ __all__ = [
 
 MAX_TRIANGLES = 300
 """build 接受的三角形数上限。"""
+
+MAX_PACKET_RAYS = 64
+"""packet_occluded 单批接受的射线条数上限（位掩码宽度）。"""
 
 LEAF_SIZE = 4
 """叶节点三角形数上限。"""
@@ -194,6 +203,43 @@ class Intersection:
         return self.hit
 
 
+@dataclass(frozen=True, slots=True)
+class OcclusionQuery:
+    """packet_occluded 的单条遮挡查询（只问“是否被挡住”）。
+
+    ray           射线，契约同 intersect（方向可含零分量、不能为零向量）
+    time          该射线自己的插值时刻 τ，必须在 [0.0, 1.0]
+    t_min, t_max  该射线自己的**半开**区间 [t_min, t_max)：t==t_max 的接触
+                  不算遮挡，t==t_min 算入；t_max=+Infinity 表示无界；
+                  t_min==t_max 为空区间（恒不遮挡）
+    ignore_faces  仅对本条射线生效的忽略 face_id 集合（set/frozenset，
+                  元素为非负 int）；None 与空集等价
+    """
+
+    ray: Ray
+    time: float = 0.0
+    t_min: float = 0.0
+    t_max: float = math.inf
+    ignore_faces: Optional[frozenset] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class OcclusionPacket:
+    """packet_occluded 的整批结果。
+
+    occluded        按输入位置的 bool 元组：True = 该射线被遮挡
+    nodes_visited   节点调度次数：实际处理的 (节点, 射线掩码) 弹栈数
+    box_tests       射线-盒测试次数：每条存活射线在每个被调度节点一次
+    triangle_tests  射线-三角形测试次数：实际执行三角形求交的 (射线,面) 对数
+                    （被该射线 ignore_faces 忽略的面不测试、不计入）
+    """
+
+    occluded: tuple
+    nodes_visited: int
+    box_tests: int
+    triangle_tests: int
+
+
 # ---------------------------------------------------------------------------
 # BVH 内部结构
 # ---------------------------------------------------------------------------
@@ -242,6 +288,9 @@ class BVH:
         t_max: float = math.inf,
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
+
+    def packet_occluded(self, queries) -> OcclusionPacket:
+        return _packet_occluded(self, queries)
 
 
 # 模块级函数也直接暴露 build/intersect 两个名字
@@ -305,6 +354,16 @@ def intersect(
 ) -> Intersection:
     """模块级入口，等价于 bvh.intersect(ray, time, t_min, t_max)。"""
     return _intersect(bvh, ray, time, t_min, t_max)
+
+
+def packet_occluded(bvh: BVH, queries) -> OcclusionPacket:
+    """模块级入口，等价于 bvh.packet_occluded(queries)。
+
+    queries 为最多 MAX_PACKET_RAYS 条 OcclusionQuery（或裸 Ray，取默认
+    time=0.0、t 区间 [0, +inf)、无忽略面）。任一查询非法即整批拒绝
+    （抛异常，不返回部分结果）。
+    """
+    return _packet_occluded(bvh, queries)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +703,155 @@ def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
     return Intersection(
         True, best_id, best_t, u, v, (px, py, pz),
         nodes_visited, triangles_tested,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 批量遮挡查询：共享节点调度 + 每节点射线位掩码
+# ---------------------------------------------------------------------------
+
+def _check_packet_t_max(t_max, where: str) -> float:
+    """与 intersect 相同的 t_max 口径：允许 +Infinity，拒绝 bool/NaN/-Infinity。"""
+    if not _is_real(t_max):
+        raise TypeError(f"{where} 必须是实数(int/float)，得到 {type(t_max).__name__}")
+    t1 = float(t_max)
+    if math.isnan(t1):
+        raise ValueError(f"{where} 不能是 NaN")
+    if math.isinf(t1) and t1 < 0.0:
+        raise ValueError(f"{where} 不能是 -Infinity")
+    return t1
+
+
+def _packet_occluded(bvh: BVH, queries) -> OcclusionPacket:
+    if not isinstance(bvh, BVH):
+        raise TypeError("遮挡查询目标必须是 motion_bvh.BVH")
+    if not isinstance(queries, (list, tuple)):
+        try:
+            queries = list(queries)
+        except TypeError as exc:
+            raise TypeError("queries 必须是 Ray/OcclusionQuery 的可迭代对象") from exc
+    n = len(queries)
+    if n > MAX_PACKET_RAYS:
+        raise ValueError(
+            f"射线条数 {n} 超过上限 {MAX_PACKET_RAYS}（接口边界，非性能建议）"
+        )
+
+    # 第一阶段：全量校验（任一非法即整批拒绝，不产生任何遍历/部分结果）
+    lanes = []  # (origin, direction, tau, t_min, t_max, ignore_frozenset)
+    for i, q in enumerate(queries):
+        where = f"queries[{i}]"
+        if isinstance(q, Ray):
+            q = OcclusionQuery(q)
+        if not isinstance(q, OcclusionQuery):
+            raise TypeError(
+                f"{where} 必须是 motion_bvh.Ray 或 motion_bvh.OcclusionQuery，"
+                f"得到 {type(q).__name__}"
+            )
+        ray = q.ray
+        if not isinstance(ray, Ray):
+            raise TypeError(
+                f"{where}.ray 必须是 motion_bvh.Ray，得到 {type(ray).__name__}"
+            )
+        tau = _check_real(q.time, f"{where}.time")
+        if not (_TIME_LO <= tau <= _TIME_HI):
+            raise ValueError(
+                f"{where}.time 必须在 [{_TIME_LO}, {_TIME_HI}] 内，得到 {tau}"
+            )
+        t0 = _check_real(q.t_min, f"{where}.t_min")
+        t1 = _check_packet_t_max(q.t_max, f"{where}.t_max")
+        if t0 > t1:
+            raise ValueError(f"{where}.t_min({t0}) 不能大于 t_max({t1})")
+        origin = _check_point(ray.origin, f"{where}.ray.origin")
+        if not isinstance(ray.direction, (tuple, list)) or len(ray.direction) != 3:
+            raise TypeError(f"{where}.ray.direction 必须是长度为 3 的序列")
+        direction = _check_point(ray.direction, f"{where}.ray.direction")
+        if direction == (0.0, 0.0, 0.0):
+            raise ValueError(f"{where}.ray.direction 不能为零向量")
+        ignore = q.ignore_faces
+        if ignore is None:
+            ignore = frozenset()
+        if not isinstance(ignore, (set, frozenset)):
+            raise TypeError(
+                f"{where}.ignore_faces 必须是 set/frozenset，"
+                f"得到 {type(ignore).__name__}"
+            )
+        ig = set()
+        for fid in ignore:
+            _check_int(fid, f"{where}.ignore_faces 元素")
+            if fid < 0:
+                raise ValueError(
+                    f"{where}.ignore_faces 元素必须非负，得到 {fid}"
+                )
+            ig.add(fid)
+        lanes.append((origin, direction, tau, t0, t1, frozenset(ig)))
+
+    occluded = [False] * n
+    root = bvh._root
+    if root is None or root.lo0 is None or n == 0:
+        return OcclusionPacket(tuple(occluded), 0, 0, 0)
+
+    # 空半开区间 [t, t) 恒不遮挡：直接以“已解决”处理，不参与调度
+    active = 0
+    for i in range(n):
+        if lanes[i][3] < lanes[i][4]:
+            active |= 1 << i
+    if not active:
+        return OcclusionPacket(tuple(occluded), 0, 0, 0)
+
+    nodes_visited = 0
+    box_tests = 0
+    triangle_tests = 0
+
+    # 共享调度：栈元素为 (节点, 仍需检查该节点的射线位掩码)。某条射线找到
+    # 有效遮挡面即从 active 清除，其后所有节点弹栈时经 mask &= active 退出；
+    # 未命中某子盒的 lane 只从该分支掩码消失，另一分支掩码不受影响。
+    stack = [(root, active)]
+    while stack:
+        if not active:
+            break
+        node, mask = stack.pop()
+        mask &= active
+        if not mask:
+            continue
+        nodes_visited += 1
+        # 每条存活射线按自己的 time 插值盒、自己的 t 窗口做盒测试
+        live = 0
+        m = mask
+        while m:
+            lsb = m & -m
+            i = lsb.bit_length() - 1
+            m ^= lsb
+            o, d, tau, t0, t1, _ig = lanes[i]
+            box_tests += 1
+            if _box_hit(node, o, d, tau, t0, t1):
+                live |= lsb
+        if not live:
+            continue
+        if node.faces is not None:
+            m = live
+            while m:
+                lsb = m & -m
+                i = lsb.bit_length() - 1
+                m ^= lsb
+                o, d, tau, t0, t1, ig = lanes[i]
+                for idx in node.faces:
+                    if bvh._face_ids[idx] in ig:
+                        continue  # 忽略面只对所属射线生效
+                    triangle_tests += 1
+                    hit = _triangle_hit(bvh._faces[idx], o, d, tau, t0, t1)
+                    if hit is None:
+                        continue
+                    # 半开区间：t == t_max 的接触不算遮挡
+                    if hit[0] < t1:
+                        occluded[i] = True
+                        active &= ~lsb  # 该射线退出其后所有节点
+                        break
+        else:
+            stack.append((node.right, live))
+            stack.append((node.left, live))
+
+    return OcclusionPacket(
+        tuple(occluded), nodes_visited, box_tests, triangle_tests
     )
 
 

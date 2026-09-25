@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """demo.py — 运动 BVH 的固定输入演示（确定性、离线、纯标准库）。
 
-做两件事：
+做三件事：
   1. 正常结果：构建一个确定性运动三角形场景，在多个时刻发射射线，
      用 BVH 与独立暴力参考（逐三角形直接求交）比对，打印二者命中一致，
      以及 BVH 实际少测了多少个面 / 访问了多少节点。
-  2. 拒绝边界：真实触发一次输入拒绝（零方向射线），打印抛出的异常。
+  2. 批量遮挡：16 条同向成束射线走 packet_occluded 共享节点调度，
+     与独立逐面遮挡 oracle 逐条比对，并对比逐条遍历的节点调度总数；
+     演示 ignore_faces 只对所属射线生效。
+  3. 拒绝边界：真实触发输入拒绝（零方向射线的单条查询与整批拒绝），
+     打印抛出的异常。
 
 运行：python demo.py     （约数秒内完成）
 """
@@ -21,8 +25,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import motion_bvh as mb
-from motion_bvh import Triangle, Ray, build, intersect
-from tests.reference import reference_intersect
+from motion_bvh import Triangle, Ray, OcclusionQuery, build, intersect, \
+    packet_occluded
+from tests.reference import reference_intersect, reference_occluded
 
 
 def make_scene(n_per_cluster=28, seed=20260922):
@@ -130,6 +135,37 @@ def main():
           f"bary=({res0.u:.6f}, {res0.v:.6f}), "
           f"point=({p[0]:.5f},{p[1]:.5f},{p[2]:.5f})")
 
+    # ---- packet_occluded：共享调度的批量遮挡查询 --------------------------
+    print("\n[packet_occluded] 16 条同向成束遮挡射线（共享节点调度）：")
+    rngp = random.Random(7)
+    pkt = []
+    for _ in range(16):
+        o = (3.0 + rngp.uniform(-0.4, 0.4), -0.5 + rngp.uniform(-0.3, 0.3), 0.0)
+        pkt.append(OcclusionQuery(Ray(o, (0.05, 0.02, 1.0)), time=0.5))
+    res = packet_occluded(bvh, pkt)
+    agree = all(
+        res.occluded[i] == reference_occluded(
+            tris, q.ray, q.time, q.t_min, q.t_max, q.ignore_faces)
+        for i, q in enumerate(pkt))
+    single_nodes = sum(intersect(bvh, q.ray, q.time).nodes_visited
+                       for q in pkt)
+    print(f"  遮挡 {sum(res.occluded)}/{len(pkt)}，"
+          f"与独立逐面参考逐条一致：{agree}")
+    print(f"  节点调度 {res.nodes_visited} 次（逐条遍历合计 {single_nodes} 次），"
+          f"射线盒测试 {res.box_tests}，射线三角形测试 {res.triangle_tests}")
+
+    # ignore_faces 只对所属射线生效：忽略 lane0 的遮挡面后重查
+    g0 = intersect(bvh, pkt[0].ray, pkt[0].time)
+    if g0.hit:
+        pkt2 = [OcclusionQuery(pkt[0].ray, time=pkt[0].time,
+                               ignore_faces={g0.face_id}), pkt[1]]
+        res2 = packet_occluded(bvh, pkt2)
+        exp0 = reference_occluded(tris, pkt2[0].ray, pkt2[0].time,
+                                  ignore_faces={g0.face_id})
+        print(f"  lane0 忽略其遮挡面 face_id={g0.face_id} 后："
+              f"occluded={res2.occluded[0]}（参考 {exp0}），"
+              f"lane1 不受影响：occluded={res2.occluded[1]}")
+
     # ---- 实际触发的拒绝边界 ---------------------------------------------
     print("\n[拒绝边界] 构造 direction=(0,0,0) 的射线并查询（预期 ValueError）：")
     bad_ray = Ray((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
@@ -139,6 +175,17 @@ def main():
         print(f"  已捕获 {type(exc).__name__}: {exc}")
     else:
         raise AssertionError("零方向射线必须被拒绝")
+
+    print("[拒绝边界] 批量遮挡中 queries[2] 为零方向射线（预期整批拒绝）：")
+    bad_pkt = [OcclusionQuery(Ray((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)))
+               for _ in range(4)]
+    bad_pkt[2] = OcclusionQuery(bad_ray)
+    try:
+        packet_occluded(bvh, bad_pkt)
+    except (ValueError, TypeError) as exc:
+        print(f"  已捕获 {type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("含非法射线的批次必须整批拒绝")
 
     dt = time.perf_counter() - t_start
     print(f"\n演示完成，实际耗时 {dt:.2f}s（无 sleep、无预录结果）。")
