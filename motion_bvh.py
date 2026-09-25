@@ -8,6 +8,10 @@
     叶节点至多 4 个三角形。
   * intersect 支持 t_min/t_max、零方向分量（零向量方向非法）、同距按 face_id
     较小者胜；输出重心坐标与访问计数。
+  * 实例层：build_scene(instances) 把多个 Instance（引用既有 BVH + 唯一
+    instance_id + 时间固定的可逆仿射变换）组织成场景层包围盒树；网格 BVH
+    被共享，不复制面列表。intersect_scene 把世界射线变换到实例局部
+    （方向不归一化，t 与世界一致），同距先比 instance_id 再比 face_id。
   * 所有数值输入拒绝 NaN/Infinity；bool 不作为整数/数值接受。
 
 本模块只依赖 Python 3.14 标准库。
@@ -26,6 +30,11 @@ __all__ = [
     "BVH",
     "build",
     "intersect",
+    "Instance",
+    "Scene",
+    "SceneIntersection",
+    "build_scene",
+    "intersect_scene",
 ]
 
 # ---------------------------------------------------------------------------
@@ -535,9 +544,15 @@ def _mid_split(indices, cents, axis):
 # 遍历
 # ---------------------------------------------------------------------------
 
-def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
-    if not isinstance(bvh, BVH):
-        raise TypeError("ray 查询目标必须是 motion_bvh.BVH")
+def _tie_tol(a, b):
+    return _TIE_ULPS * _EPS * max(1.0, abs(a), abs(b))
+
+
+def _validate_query(ray, time, t_min, t_max):
+    """校验 ray/time/t_min/t_max（BVH 与 Scene 查询共用同一契约）。
+
+    返回 (origin, direction, tau, t0, t1)，全部为 float 元组/标量。
+    """
     if not isinstance(ray, Ray):
         raise TypeError("ray 必须是 motion_bvh.Ray")
     tau = _check_real(time, "time")
@@ -562,6 +577,13 @@ def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
     direction = _check_point(ray.direction, "ray.direction")
     if direction == (0.0, 0.0, 0.0):
         raise ValueError("ray.direction 不能为零向量")
+    return origin, direction, tau, t0, t1
+
+
+def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
+    if not isinstance(bvh, BVH):
+        raise TypeError("ray 查询目标必须是 motion_bvh.BVH")
+    origin, direction, tau, t0, t1 = _validate_query(ray, time, t_min, t_max)
 
     root = bvh._root
     if root is None or root.lo0 is None:
@@ -575,9 +597,6 @@ def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
     # 最终赢家 = 与全局最小 t 相差 ≤ tie_tol 的候选中 face_id 最小者。
     abs_best = t1
     win = None
-
-    def tie_tol(a, b):
-        return _TIE_ULPS * _EPS * max(1.0, abs(a), abs(b))
 
     stack = [root]
     while stack:
@@ -612,11 +631,11 @@ def _intersect(bvh: BVH, ray: Ray, time, t_min, t_max) -> Intersection:
                     win = (ht, hu, hv, fid, idx)
                 elif ht < abs_best:
                     abs_best = ht
-                    band = tie_tol(win[0], ht)
+                    band = _tie_tol(win[0], ht)
                     if win[0] > ht + band or fid < win[3]:
                         win = (ht, hu, hv, fid, idx)
                 else:
-                    band = tie_tol(ht, abs_best)
+                    band = _tie_tol(ht, abs_best)
                     if abs(ht - abs_best) <= band and fid < win[3]:
                         win = (ht, hu, hv, fid, idx)
         else:
@@ -718,3 +737,408 @@ def _triangle_hit(face, o, d, tau, t_min, t_max):
     if u + v > 1.0:
         v = 1.0 - u
     return t, u, v
+
+
+# ---------------------------------------------------------------------------
+# 实例与场景：多个实例共享同一棵网格 BVH
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class Instance:
+    """一个网格实例：引用既有 BVH，外加唯一 instance_id 与时间固定的仿射变换。
+
+    bvh          由 motion_bvh.build 构造的网格 BVH（多个实例可引用同一对象，
+                 底层树与面列表被共享，不复制重建）
+    instance_id  唯一非负 int（拒绝 bool），场景内同距决胜的第一关键字
+    matrix       3x3 行主序线性变换（3 行、每行 3 个实数），必须可逆；
+                 允许旋转、非均匀缩放、剪切、镜像（负行列式）
+    translation  长度 3 的平移向量
+
+    世界坐标 = matrix @ 局部坐标 + translation。变换在时间上固定；
+    网格自身仍按 time 参数做线性顶点运动。
+    """
+
+    bvh: "BVH"
+    instance_id: int
+    matrix: tuple
+    translation: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class SceneIntersection:
+    """场景查询结果。未命中时 hit=False，计数字段仍有效。
+
+    hit                是否命中
+    instance_id        命中实例标识；未命中为 None
+    face_id            命中三角形在网格内的原始 face_id；未命中为 None
+    t                  射线参数（世界与实例局部一致，因局部方向未归一化）
+    u, v               重心坐标（局部三角形，与世界重心坐标相同）
+    point              世界坐标命中点
+    scene_boxes_tested 场景层包围盒测试次数（含根）
+    mesh_boxes_tested  底层网格 BVH 盒测试次数（各实例合计）
+    triangles_tested   实际三角形相交测试次数（各实例合计）
+    """
+
+    hit: bool
+    instance_id: Optional[int]
+    face_id: Optional[int]
+    t: float
+    u: float
+    v: float
+    point: Optional[tuple]
+    scene_boxes_tested: int
+    mesh_boxes_tested: int
+    triangles_tested: int
+
+    def __bool__(self) -> bool:
+        return self.hit
+
+
+def _check_matrix(m, where: str):
+    """校验 3x3 行主序矩阵，返回 float 元组的元组。"""
+    if not isinstance(m, (tuple, list)):
+        raise TypeError(f"{where} 必须是 3x3 序列（3 行），得到 {type(m).__name__}")
+    if len(m) != 3:
+        raise TypeError(f"{where} 必须恰好 3 行，得到 {len(m)}")
+    rows = []
+    for i, row in enumerate(m):
+        if not isinstance(row, (tuple, list)) or len(row) != 3:
+            raise TypeError(f"{where}[{i}] 必须是长度为 3 的序列")
+        rows.append(tuple(_check_real(row[k], f"{where}[{i}][{k}]")
+                          for k in range(3)))
+    return tuple(rows)
+
+
+def _mat_det(m) -> float:
+    (a, b, c), (d, e, f), (g, h, i) = m
+    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+
+def _mat_inverse(m, det: float, where: str):
+    """伴随矩阵法求逆；任一逆元非有限即拒绝（不放大容差混过去）。"""
+    (a, b, c), (d, e, f), (g, h, i) = m
+    c00 = e * i - f * h
+    c01 = -(d * i - f * g)
+    c02 = d * h - e * g
+    c10 = -(b * i - c * h)
+    c11 = a * i - c * g
+    c12 = -(a * h - b * g)
+    c20 = b * f - c * e
+    c21 = -(a * f - c * d)
+    c22 = a * e - b * d
+    inv = (
+        (c00 / det, c10 / det, c20 / det),
+        (c01 / det, c11 / det, c21 / det),
+        (c02 / det, c12 / det, c22 / det),
+    )
+    for r, row in enumerate(inv):
+        for k, x in enumerate(row):
+            if math.isnan(x) or math.isinf(x):
+                raise ValueError(
+                    f"{where} 的逆矩阵含非有限值（[{r}][{k}]），拒绝该变换"
+                )
+    return inv
+
+
+def _mat_vec(m, v):
+    return (
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    )
+
+
+class _InstRec:
+    """校验后的实例内部记录。"""
+
+    __slots__ = ("iid", "bvh", "mat", "inv", "trans", "box")
+
+    def __init__(self, iid, bvh, mat, inv, trans, box):
+        self.iid = iid
+        self.bvh = bvh
+        self.mat = mat
+        self.inv = inv
+        self.trans = trans
+        self.box = box  # 世界 AABB (lo, hi)，覆盖整个运动区间（含护栏）
+
+
+class _SceneNode:
+    __slots__ = ("lo", "hi", "left", "right", "inst")
+
+    def __init__(self):
+        self.lo = self.hi = None
+        self.left: Optional[_SceneNode] = None
+        self.right: Optional[_SceneNode] = None
+        self.inst: Optional[int] = None  # 叶节点：实例记录下标
+
+
+class Scene:
+    """不可变的实例场景层次树。请通过 motion_bvh.build_scene 构造。"""
+
+    __slots__ = ("_recs", "_root", "_count")
+
+    def __init__(self):
+        raise TypeError("Scene 不可直接构造，请使用 motion_bvh.build_scene()")
+
+    @classmethod
+    def _from_parts(cls, recs, root):
+        self = object.__new__(cls)
+        self._recs = recs
+        self._root = root
+        self._count = len(recs)
+        return self
+
+    @property
+    def instance_count(self) -> int:
+        return self._count
+
+    def intersect(
+        self,
+        ray: Ray,
+        time: float,
+        t_min: float = 0.0,
+        t_max: float = math.inf,
+    ) -> SceneIntersection:
+        return _intersect_scene(self, ray, time, t_min, t_max)
+
+
+def build_scene(instances: Sequence[Instance]) -> Scene:
+    """由实例列表构建场景层包围盒树。
+
+    全量校验（含每个实例的逆矩阵有限性、世界包围盒有限性）通过后才建树：
+    重复 instance_id、非有限数、奇异矩阵都会产生异常且不留任何部分场景。
+    空列表合法，得到空场景（任意查询均未命中）。
+    """
+    if not isinstance(instances, (list, tuple)):
+        try:
+            instances = list(instances)
+        except TypeError as exc:
+            raise TypeError("instances 必须是 Instance 的可迭代对象") from exc
+
+    recs = []
+    seen_ids = set()
+    for i, inst in enumerate(instances):
+        where = f"instances[{i}]"
+        if not isinstance(inst, Instance):
+            raise TypeError(
+                f"{where} 必须是 motion_bvh.Instance，得到 {type(inst).__name__}"
+            )
+        if not isinstance(inst.bvh, BVH):
+            raise TypeError(
+                f"{where}.bvh 必须是 motion_bvh.BVH，得到 {type(inst.bvh).__name__}"
+            )
+        iid = _check_int(inst.instance_id, f"{where}.instance_id")
+        if iid < 0:
+            raise ValueError(f"{where}.instance_id 必须非负，得到 {iid}")
+        if iid in seen_ids:
+            raise ValueError(f"{where}.instance_id={iid} 与前面的实例重复")
+        seen_ids.add(iid)
+        mat = _check_matrix(inst.matrix, f"{where}.matrix")
+        trans = _check_point(inst.translation, f"{where}.translation")
+        det = _mat_det(mat)
+        if math.isnan(det) or math.isinf(det) or det == 0.0:
+            raise ValueError(
+                f"{where}.matrix 奇异（行列式={det}），实例变换必须可逆"
+            )
+        inv = _mat_inverse(mat, det, f"{where}.matrix")
+
+        # 世界包围盒：网格两端 AABB 各 8 角点变换后的并集（保守界，覆盖
+        # 整个运动区间；仿射变换下盒像的 AABB 即角点像的 AABB）。
+        root = inst.bvh._root
+        if root is None:
+            box = _EMPTY_BOX
+        else:
+            box = _EMPTY_BOX
+            for lo, hi in ((root.lo0, root.hi0), (root.lo1, root.hi1)):
+                for cx in (lo[0], hi[0]):
+                    for cy in (lo[1], hi[1]):
+                        for cz in (lo[2], hi[2]):
+                            p = _mat_vec(mat, (cx, cy, cz))
+                            box = _union_box(
+                                box,
+                                (p[0] + trans[0], p[1] + trans[1],
+                                 p[2] + trans[2]),
+                            )
+            for k in range(3):
+                for bound in box:
+                    if math.isnan(bound[k]) or math.isinf(bound[k]):
+                        raise ValueError(
+                            f"{where} 的世界包围盒含非有限值，拒绝该变换"
+                        )
+            # 护栏：网格层重心边界宽限（局部 g_eps）经线性映射放大后的上界
+            # （Frobenius 范数 ≥ 最大奇异值），再加个位 ulp 的变换舍入。
+            frob = math.sqrt(
+                sum(x * x for row in mat for x in row)
+            )
+            guard = frob * root.g_eps
+            (lo, hi) = box
+            guard += 8.0 * _EPS * max(
+                1.0, abs(lo[0]), abs(lo[1]), abs(lo[2]),
+                abs(hi[0]), abs(hi[1]), abs(hi[2]),
+            )
+            box = (
+                (lo[0] - guard, lo[1] - guard, lo[2] - guard),
+                (hi[0] + guard, hi[1] + guard, hi[2] + guard),
+            )
+        recs.append(_InstRec(iid, inst.bvh, mat, inv, trans, box))
+
+    # 校验全部通过，开始建树（不会再失败）
+    root = _scene_build(recs, list(range(len(recs)))) if recs else None
+    return Scene._from_parts(recs, root)
+
+
+def intersect_scene(
+    scene: Scene,
+    ray: Ray,
+    time: float,
+    t_min: float = 0.0,
+    t_max: float = math.inf,
+) -> SceneIntersection:
+    """模块级入口，等价于 scene.intersect(ray, time, t_min, t_max)。"""
+    return _intersect_scene(scene, ray, time, t_min, t_max)
+
+
+def _scene_build(recs, idxs):
+    """场景层树：叶为单个实例；按质心最长轴稳定中分（实例数通常很小，
+    划分质量对正确性无影响，仅影响剪枝效率）。"""
+    node = _SceneNode()
+    lo = [math.inf] * 3
+    hi = [-math.inf] * 3
+    for j in idxs:
+        (blo, bhi) = recs[j].box
+        for k in range(3):
+            if blo[k] < lo[k]:
+                lo[k] = blo[k]
+            if bhi[k] > hi[k]:
+                hi[k] = bhi[k]
+    node.lo = (lo[0], lo[1], lo[2])
+    node.hi = (hi[0], hi[1], hi[2])
+    if len(idxs) == 1:
+        node.inst = idxs[0]
+        return node
+
+    cents = []
+    for j in idxs:
+        (blo, bhi) = recs[j].box
+        if blo[0] <= bhi[0]:
+            cents.append(tuple(0.5 * (blo[k] + bhi[k]) for k in range(3)))
+        else:
+            cents.append((math.inf, math.inf, math.inf))  # 空盒（空网格实例）
+    axis = 0
+    for k in (1, 2):
+        ext_k = max(c[k] for c in cents) - min(c[k] for c in cents)
+        ext_a = max(c[axis] for c in cents) - min(c[axis] for c in cents)
+        if ext_k > ext_a:
+            axis = k
+    order = sorted(range(len(idxs)),
+                   key=lambda j: (cents[j][axis], idxs[j]))
+    half = len(order) // 2
+    node.left = _scene_build(recs, [idxs[o] for o in order[:half]])
+    node.right = _scene_build(recs, [idxs[o] for o in order[half:]])
+    return node
+
+
+def _scene_box_hit(node, o, d, t_min, t_max) -> bool:
+    """静态 AABB 的 Slab 测试（实例盒已覆盖整个运动区间，无需插值）。"""
+    lo, hi = node.lo, node.hi
+    if lo[0] > hi[0]:
+        return False  # 空盒（空网格实例或空场景子树）
+    tnear, tfar = t_min, t_max
+    for k in range(3):
+        dk = d[k]
+        if dk == 0.0:
+            if o[k] < lo[k] or o[k] > hi[k]:
+                return False
+            continue
+        t1 = (lo[k] - o[k]) / dk
+        t2 = (hi[k] - o[k]) / dk
+        if t1 < t2:
+            tn, tf = t1, t2
+        else:
+            tn, tf = t2, t1
+        if tn > tnear:
+            tnear = tn
+        if tf < tfar:
+            tfar = tf
+        if tnear > tfar:
+            return False
+    return True
+
+
+def _intersect_scene(scene: Scene, ray: Ray, time, t_min, t_max
+                     ) -> SceneIntersection:
+    if not isinstance(scene, Scene):
+        raise TypeError("ray 查询目标必须是 motion_bvh.Scene")
+    origin, direction, tau, t0, t1 = _validate_query(ray, time, t_min, t_max)
+
+    root = scene._root
+    if root is None:
+        return SceneIntersection(
+            False, None, None, math.nan, math.nan, math.nan, None, 0, 0, 0)
+
+    scene_boxes = 0
+    mesh_boxes = 0
+    tri_tests = 0
+
+    # 与网格层同款两阶段规则：abs_best 为严格最小 t，win 为同距带内
+    # 按 (instance_id, face_id) 的决胜候选，结果与遍历顺序无关。
+    abs_best = t1
+    win = None  # (t, instance_id, face_id, u, v, local_point, rec)
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        scene_boxes += 1
+        # 剪枝窗口外放同距带（同网格层，保证同距实例不被提前剔除）
+        if math.isinf(abs_best):
+            window = abs_best
+        else:
+            window = abs_best + (_TIE_ULPS + 2) * _EPS * max(
+                1.0, abs(abs_best))
+        if not _scene_box_hit(node, origin, direction, t0, window):
+            continue
+        if node.inst is not None:
+            rec = scene._recs[node.inst]
+            # 世界射线 -> 实例局部：方向不归一化，局部与世界的 t 一致
+            rel = (origin[0] - rec.trans[0], origin[1] - rec.trans[1],
+                   origin[2] - rec.trans[2])
+            o_l = _mat_vec(rec.inv, rel)
+            d_l = _mat_vec(rec.inv, direction)
+            local = _intersect(rec.bvh, Ray(o_l, d_l), tau, t0, window)
+            mesh_boxes += local.nodes_visited
+            tri_tests += local.triangles_tested
+            if local.hit:
+                ht = local.t
+                key = (rec.iid, local.face_id)
+                cand = (ht, rec.iid, local.face_id, local.u, local.v,
+                        local.point, rec)
+                if win is None:
+                    abs_best = ht
+                    win = cand
+                elif ht < abs_best:
+                    abs_best = ht
+                    band = _tie_tol(win[0], ht)
+                    if win[0] > ht + band or key < (win[1], win[2]):
+                        win = cand
+                else:
+                    band = _tie_tol(ht, abs_best)
+                    if abs(ht - abs_best) <= band and key < (win[1], win[2]):
+                        win = cand
+        else:
+            stack.append(node.right)
+            stack.append(node.left)
+
+    if win is None:
+        return SceneIntersection(
+            False, None, None, math.nan, math.nan, math.nan, None,
+            scene_boxes, mesh_boxes, tri_tests,
+        )
+
+    best_t, best_iid, best_fid, best_u, best_v, local_p, rec = win
+    # 命中点变换回世界坐标
+    pw = _mat_vec(rec.mat, local_p)
+    point = (pw[0] + rec.trans[0], pw[1] + rec.trans[1], pw[2] + rec.trans[2])
+    return SceneIntersection(
+        True, best_iid, best_fid, best_t, best_u, best_v, point,
+        scene_boxes, mesh_boxes, tri_tests,
+    )

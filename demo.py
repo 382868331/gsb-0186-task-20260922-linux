@@ -21,8 +21,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import motion_bvh as mb
-from motion_bvh import Triangle, Ray, build, intersect
-from tests.reference import reference_intersect
+from motion_bvh import (
+    Triangle, Ray, build, intersect, Instance, build_scene, intersect_scene,
+)
+from tests.reference import reference_intersect, reference_scene_intersect
 
 
 def make_scene(n_per_cluster=28, seed=20260922):
@@ -195,6 +197,101 @@ def run_limit_scale_pass():
           f"用时 {dt:.2f}s。")
 
 
+def run_instance_pass():
+    """实例场景演示：同一网格 BVH 的两个实例（不同仿射变换）真实查询，
+    与“三角形显式变换到世界坐标逐面求交”的独立参考比对；
+    再真实触发一次奇异变换拒绝。"""
+    t0 = time.perf_counter()
+    # 网格：一小簇带运动的三角形（只 build 一次）
+    tris = make_scene(n_per_cluster=14, seed=7)[:30]
+    bvh = build(tris)
+
+    rot = ((0.8, -0.6, 0.0), (0.6, 0.8, 0.0), (0.0, 0.0, 1.0))  # 绕 z 旋转
+    scale = ((1.6, 0.0, 0.0), (0.0, 0.7, 0.0), (0.0, 0.0, 1.2))  # 非均匀缩放
+    mirror = ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))  # x 镜像
+    shear = ((1.0, 0.35, 0.0), (0.0, 1.0, 0.2), (0.0, 0.0, 1.0))
+
+    def matmul(A, B):
+        return tuple(tuple(sum(A[i][k] * B[k][j] for k in range(3))
+                           for j in range(3)) for i in range(3))
+
+    mat_a = matmul(rot, scale)
+    mat_b = matmul(mirror, shear)
+    ta = (6.0, 1.0, 2.0)
+    tb = (-6.0, -2.0, 5.0)
+    inst_a = Instance(bvh, 1001, mat_a, ta)
+    inst_b = Instance(bvh, 1002, mat_b, tb)
+    scene = build_scene([inst_a, inst_b])
+    print(f"\n[实例场景] 同一网格 BVH（{len(tris)} 面）被 2 个实例共享"
+          f"（底层树同一对象：{inst_a.bvh is inst_b.bvh}），"
+          f"instance_id=1001（旋转+非均匀缩放）、1002（镜像+剪切）")
+
+    refs = [(1001, mat_a, ta, tris), (1002, mat_b, tb, tris)]
+
+    def world_centroid(tri, mat, trans, tau):
+        lc = tuple(sum((tri.a0[k] + tau * (tri.a1[k] - tri.a0[k]),
+                        tri.b0[k] + tau * (tri.b1[k] - tri.b0[k]),
+                        tri.c0[k] + tau * (tri.c1[k] - tri.c0[k]))[j]
+                   for j in range(3)) / 3.0 for k in range(3))
+        return tuple(sum(mat[i][k] * lc[k] for k in range(3)) + trans[i]
+                     for i in range(3))
+
+    def aimed(tri, mat, trans, tau, back=25.0):
+        tgt = world_centroid(tri, mat, trans, tau)
+        o = (tgt[0] + 0.3, tgt[1] - 0.2, tgt[2] - back)
+        return Ray(o, (tgt[0] - o[0], tgt[1] - o[1], tgt[2] - o[2]))
+
+    queries = [
+        (aimed(tris[3], mat_a, ta, 0.0), 0.0),
+        (aimed(tris[10], mat_a, ta, 0.5), 0.5),
+        (aimed(tris[20], mat_a, ta, 1.0), 1.0),
+        (aimed(tris[5], mat_b, tb, 0.25), 0.25),
+        (aimed(tris[15], mat_b, tb, 0.75), 0.75),
+        (Ray((30.0, 30.0, 30.0), (-1.0, -1.0, -1.0)), 0.6),  # 明显未命中
+    ]
+    agree = 0
+    s_boxes = m_boxes = t_tests = 0
+    for qi, (ray, tau) in enumerate(queries):
+        got = intersect_scene(scene, ray, tau)
+        exp = reference_scene_intersect(refs, ray, tau)
+        s_boxes += got.scene_boxes_tested
+        m_boxes += got.mesh_boxes_tested
+        t_tests += got.triangles_tested
+        ok = got.hit == exp["hit"] and (not got.hit or (
+            got.instance_id == exp["instance_id"]
+            and got.face_id == exp["face_id"]
+            and abs(got.t - exp["t"]) <= 1e-9 * max(1.0, abs(exp["t"]))))
+        agree += ok
+        if got.hit:
+            p = got.point
+            print(f"  查询{qi} τ={tau:<4} 命中 inst={got.instance_id} "
+                  f"face={got.face_id:<3d} t={got.t:8.4f} "
+                  f"世界点=({p[0]:6.3f},{p[1]:6.3f},{p[2]:6.3f}) "
+                  f"盒(场景/底层)=({got.scene_boxes_tested},{got.mesh_boxes_tested})"
+                  f" 测面={got.triangles_tested} 参考一致={ok}")
+        else:
+            print(f"  查询{qi} τ={tau:<4} 未命中（证明无解）"
+                  f" 盒(场景/底层)=({got.scene_boxes_tested},{got.mesh_boxes_tested})"
+                  f" 测面={got.triangles_tested} 参考一致={ok}")
+    print(f"  与独立参考（三角形显式变换到世界逐面求交）一致 "
+          f"{agree}/{len(queries)}；计数合计：场景盒 {s_boxes}、"
+          f"底层盒 {m_boxes}、三角形 {t_tests}")
+
+    # ---- 奇异变换拒绝（实际触发） --------------------------------------
+    print("\n[拒绝边界] 用奇异矩阵（第 2 行 = 2 × 第 1 行）构建实例：")
+    singular = ((1.0, 2.0, 3.0), (2.0, 4.0, 6.0), (0.0, 1.0, 0.0))
+    try:
+        build_scene([Instance(bvh, 2001, singular, (0.0, 0.0, 0.0))])
+    except (ValueError, TypeError) as exc:
+        print(f"  已捕获 {type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("奇异矩阵必须被拒绝")
+
+    dt = time.perf_counter() - t0
+    print(f"实例演示完成，用时 {dt:.2f}s。")
+
+
 if __name__ == "__main__":
     main()
     run_limit_scale_pass()
+    run_instance_pass()
