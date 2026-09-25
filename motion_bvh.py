@@ -10,6 +10,21 @@
     较小者胜；输出重心坐标与访问计数。
   * 所有数值输入拒绝 NaN/Infinity；bool 不作为整数/数值接受。
 
+实例层（构建后不变）：
+  * Instance 引用一个已构建的 BVH（多个实例共享同一棵底层树，不复制面列表），
+    带唯一非负 instance_id、固定可逆 3×3 线性矩阵 M 与平移 T（世界点 = M·局部+T），
+    允许旋转、非均匀缩放、剪切、镜像（负行列式）。
+  * build_scene(instances) -> SceneBVH：对实例的“整运动区间保守世界 AABB”
+    （两端点 AABB 分别变换到世界后的并集）再建一层 8 桶 SAH 树。
+  * intersect_scene 把世界射线变到实例局部（o'=M⁻¹(o−T)、d'=M⁻¹d，方向
+    **不归一化**，故局部/世界射线参数 t 相同），遍历底层树；结果返回
+    instance_id、原 face_id、世界命中点、原局部重心坐标。同距带沿用基线
+    定义，带内先按 instance_id 再按 face_id 决胜。
+  * 计数区分：scene_boxes_tested（场景盒）、underlying_boxes_tested（底层
+    网格盒）、triangles_tested（实际三角形）。
+  * 全部实例先验证再建场景：重复 ID、非有限数、奇异矩阵、逆矩阵非有限值
+    都会整体拒绝，不产生部分场景。旧 build/intersect 不受影响。
+
 本模块只依赖 Python 3.14 标准库。
 """
 
@@ -26,6 +41,11 @@ __all__ = [
     "BVH",
     "build",
     "intersect",
+    "Instance",
+    "SceneIntersection",
+    "SceneBVH",
+    "build_scene",
+    "intersect_scene",
 ]
 
 # ---------------------------------------------------------------------------
@@ -194,6 +214,56 @@ class Intersection:
         return self.hit
 
 
+@dataclass(frozen=True, slots=True)
+class Instance:
+    """一个固定实例：引用已构建的 BVH，外加实例自身的刚体般放置变换。
+
+    bvh              被引用的底层 BVH；多个 Instance 可引用同一个 BVH，
+                     共享底层树与面数据，不复制、不重新 build。
+    instance_id      场景内唯一的非负 int（同距决胜的第一关键字）。
+    matrix           可逆 3×3 线性部分，按行给出的 3 个长度 3 序列；
+                     世界点 P = M·p + translation。允许旋转、非均匀缩放、
+                     剪切、镜像（行列式可为负），但必须可逆（非奇异）。
+    translation      长度 3 的平移向量，缺省为 (0,0,0)。
+    变换在时间上固定；被引用网格仍按查询的 time 参数运动。
+    """
+
+    bvh: "BVH"
+    instance_id: int
+    matrix: Sequence[Sequence[float]]
+    translation: Optional[Sequence[float]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class SceneIntersection:
+    """实例场景查询结果。未命中时 hit=False，三个计数字段仍有效。
+
+    hit                       是否命中
+    instance_id               命中实例标识；未命中为 None
+    face_id                   该实例底层网格中的原 face_id；未命中为 None
+    t                         射线参数（世界与局部一致：方向未归一化）
+    u, v                      原局部网格的重心坐标（不变换回来）
+    point                     世界坐标命中点
+    scene_boxes_tested        场景层执行了射线测试的 AABB 数（含根）
+    underlying_boxes_tested   所有实例底层树执行了盒测试的节点总数
+    triangles_tested          所有实例底层树实际做三角形求交的面总数
+    """
+
+    hit: bool
+    instance_id: Optional[int]
+    face_id: Optional[int]
+    t: float
+    u: float
+    v: float
+    point: Optional[tuple]
+    scene_boxes_tested: int
+    underlying_boxes_tested: int
+    triangles_tested: int
+
+    def __bool__(self) -> bool:
+        return self.hit
+
+
 # ---------------------------------------------------------------------------
 # BVH 内部结构
 # ---------------------------------------------------------------------------
@@ -242,6 +312,56 @@ class BVH:
         t_max: float = math.inf,
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
+
+
+class _SNode:
+    """场景层节点：叶节点持有若干实例记录，内部节点持有两个孩子。"""
+
+    __slots__ = ("lo", "hi", "left", "right", "items")
+
+    def __init__(self):
+        self.lo = None
+        self.hi = None
+        self.left: Optional[_SNode] = None
+        self.right: Optional[_SNode] = None
+        # 叶节点：(instance_id, bvh, M 行元组, invM 行元组, T, centroid)
+        self.items: Optional[tuple] = None
+
+
+class SceneBVH:
+    """构建后不变的实例层次。请通过 motion_bvh.build_scene 构造。
+
+    场景节点存每个实例“整运动区间”的保守世界 AABB（底层 BVH 两端 AABB
+    分别做仿射变换后的并集），该盒与查询时刻无关；实例被引用的底层 BVH
+    在多个实例间共享，不复制面列表、不重新建树。
+    """
+
+    __slots__ = ("_root", "_count", "_shared_bvh")
+
+    def __init__(self):
+        raise TypeError("SceneBVH 不可直接构造，请使用 motion_bvh.build_scene()")
+
+    @classmethod
+    def _from_root(cls, root, count, shared_bvh):
+        self = object.__new__(cls)
+        self._root = root
+        self._count = count
+        # 仅用于“共享同一棵树”的自省/断言，不参与遍历
+        self._shared_bvh = shared_bvh
+        return self
+
+    @property
+    def instance_count(self) -> int:
+        return self._count
+
+    def intersect(
+        self,
+        ray: Ray,
+        time: float,
+        t_min: float = 0.0,
+        t_max: float = math.inf,
+    ) -> SceneIntersection:
+        return _intersect_scene(self, ray, time, t_min, t_max)
 
 
 # 模块级函数也直接暴露 build/intersect 两个名字
@@ -305,6 +425,535 @@ def intersect(
 ) -> Intersection:
     """模块级入口，等价于 bvh.intersect(ray, time, t_min, t_max)。"""
     return _intersect(bvh, ray, time, t_min, t_max)
+
+
+# ---------------------------------------------------------------------------
+# 实例场景：校验 + 保守盒 + 第二层 SAH + 实例化遍历
+# ---------------------------------------------------------------------------
+
+_SCENE_LEAF_SIZE = 4
+
+
+def build_scene(instances: Sequence[Instance]) -> SceneBVH:
+    """由 Instance 列表构建实例场景层次。
+
+    全量校验通过后才建树：重复 instance_id、非有限数、奇异矩阵、逆矩阵
+    含非有限值、实例世界包围盒计算溢出（非有限）都会整体拒绝，不产生
+    部分场景。空列表合法（空场景，任何查询未命中）。
+    """
+    if not isinstance(instances, (list, tuple)):
+        try:
+            instances = list(instances)
+        except TypeError as exc:
+            raise TypeError("instances 必须是 Instance 的可迭代对象") from exc
+    n = len(instances)
+
+    # 单遍校验 + 物化（与 build 同一风格：只有全部通过且末尾才返回对象；
+    # 失败调用不修改任何已存在的 BVH/场景，无外部可见的部分结果）。
+    seen_ids = set()
+    records = []
+    shared_bvh = None
+    for i, inst in enumerate(instances):
+        where = f"instances[{i}]"
+        if not isinstance(inst, Instance):
+            raise TypeError(
+                f"{where} 必须是 motion_bvh.Instance，得到 {type(inst).__name__}"
+            )
+        iid = _check_int(inst.instance_id, f"{where}.instance_id")
+        if iid < 0:
+            raise ValueError(f"{where}.instance_id 必须非负，得到 {iid}")
+        if iid in seen_ids:
+            raise ValueError(f"{where}.instance_id={iid} 与前面的实例重复")
+        seen_ids.add(iid)
+        if not isinstance(inst.bvh, BVH):
+            raise TypeError(
+                f"{where}.bvh 必须是 motion_bvh.BVH（请先用 build 构建），"
+                f"得到 {type(inst.bvh).__name__}"
+            )
+        M = _check_matrix(inst.matrix, f"{where}.matrix")
+        if inst.translation is None:
+            T = (0.0, 0.0, 0.0)
+        else:
+            T = _check_point(inst.translation, f"{where}.translation")
+        invM, det = _invert_matrix3(M)
+        if det == 0.0:
+            raise ValueError(
+                f"{where}.matrix 奇异（行列式为 0），实例变换必须可逆"
+            )
+        for r in range(3):
+            for c in range(3):
+                if not math.isfinite(invM[r][c]):
+                    # 有限输入 + 非零行列式在普通量级下不会发生；一旦发生
+                    # （如乘积溢出致 inf/NaN）如实拒绝，不放大容差放行。
+                    raise ValueError(
+                        f"{where}.matrix 的逆矩阵含非有限值，拒绝该变换"
+                    )
+        lo, hi = _instance_world_box(inst.bvh, M, T)
+        for k in range(3):
+            if not (math.isfinite(lo[k]) and math.isfinite(hi[k])):
+                raise ValueError(
+                    f"{where} 的世界包围盒含非有限值（变换与网格坐标之积溢出），"
+                    f"拒绝该实例"
+                )
+        centroid = tuple((lo[k] + hi[k]) * 0.5 for k in range(3))
+        records.append((iid, inst.bvh, M, invM, T, lo, hi, centroid))
+        if i == 0:
+            shared_bvh = inst.bvh
+        elif shared_bvh is not None and inst.bvh is not shared_bvh:
+            shared_bvh = None
+
+    # 校验全部通过，开始建树（不会再失败）
+    root = _build_scene(records, list(range(n))) if n else None
+    return SceneBVH._from_root(root, n, shared_bvh)
+
+
+def intersect_scene(
+    scene: SceneBVH,
+    ray: Ray,
+    time: float,
+    t_min: float = 0.0,
+    t_max: float = math.inf,
+) -> SceneIntersection:
+    """模块级入口，等价于 scene.intersect(ray, time, t_min, t_max)。"""
+    return _intersect_scene(scene, ray, time, t_min, t_max)
+
+
+def _check_matrix(m, where: str):
+    """校验 3×3 矩阵：3 行，每行 3 个有限实数，bool 拒绝；返回行元组。"""
+    if not isinstance(m, (tuple, list)):
+        raise TypeError(f"{where} 必须是 3×3 序列（3 行，每行 3 个数）")
+    if len(m) != 3:
+        raise TypeError(f"{where} 必须恰好含 3 行，得到 {len(m)}")
+    rows = []
+    for r in range(3):
+        row = m[r]
+        if not isinstance(row, (tuple, list)):
+            raise TypeError(f"{where}[{r}] 必须是长度为 3 的序列(tuple/list)")
+        if len(row) != 3:
+            raise TypeError(
+                f"{where}[{r}] 必须恰好含 3 个分量，得到 {len(row)}"
+            )
+        rows.append((
+            _check_real(row[0], f"{where}[{r}][0]"),
+            _check_real(row[1], f"{where}[{r}][1]"),
+            _check_real(row[2], f"{where}[{r}][2]"),
+        ))
+    return tuple(rows)
+
+
+def _invert_matrix3(m):
+    """闭式 3×3 求逆（余因子/行列式），返回 (inv 行元组, det)。
+
+    输入全部有限。det==0 表示奇异，由调用方拒绝；inv 出现非有限值
+    同样由调用方拒绝。不设置任何“接近奇异”的阈值——非零即接受，
+    但非有限的逆绝不放行。
+    """
+    (a, b, c), (d, e, f), (g, h, i) = m
+    A = e * i - f * h
+    B = -(d * i - f * g)
+    C = d * h - e * g
+    det = a * A + b * B + c * C
+    if det == 0.0:
+        return None, 0.0
+    inv_det = 1.0 / det
+    inv = (
+        (A * inv_det,
+         (c * h - b * i) * inv_det,
+         (b * f - c * e) * inv_det),
+        (B * inv_det,
+         (a * i - c * g) * inv_det,
+         (c * d - a * f) * inv_det),
+        ((d * h - e * g) * inv_det,  # == C*inv_det，保持展开形式独立抄写
+         (b * g - a * h) * inv_det,
+         (a * e - b * d) * inv_det),
+    )
+    return inv, det
+
+
+def _apply_affine(M, T, p):
+    return (
+        M[0][0] * p[0] + M[0][1] * p[1] + M[0][2] * p[2] + T[0],
+        M[1][0] * p[0] + M[1][1] * p[1] + M[1][2] * p[2] + T[1],
+        M[2][0] * p[0] + M[2][1] * p[1] + M[2][2] * p[2] + T[2],
+    )
+
+
+def _transform_box(lo, hi, M, T):
+    """轴对齐盒经仿射变换后的保守 AABB：变换 8 个角点取并集。"""
+    box = _EMPTY_BOX
+    for sx in (lo[0], hi[0]):
+        for sy in (lo[1], hi[1]):
+            for sz in (lo[2], hi[2]):
+                box = _union_box(box, _apply_affine(M, T, (sx, sy, sz)))
+    return box
+
+
+def _union_pair(box_a, box_b):
+    (lo0, hi0), (lo1, hi1) = box_a, box_b
+    return (
+        (min(lo0[0], lo1[0]), min(lo0[1], lo1[1]), min(lo0[2], lo1[2])),
+        (max(hi0[0], hi1[0]), max(hi0[1], hi1[1]), max(hi0[2], hi1[2])),
+    )
+
+
+def _instance_world_box(bvh: BVH, M, T):
+    """实例整运动区间的保守世界 AABB。
+
+    取底层根节点 t=0、t=1 两端 AABB 分别仿射变换到世界后的并集。
+    顶点在两端之间线性运动、仿射保持线性，任意 τ 的变换后顶点都在
+    两端变换位置的凸包内，故被两端变换盒的并集包含（保守界，不要求最紧）。
+    """
+    root = bvh._root
+    if root is None or root.lo0 is None:
+        # 空底层 BVH：无几何可包围。退化为平移点的空场景不会被查询命中，
+        # 给一个平移点的退化盒（后续遍历时该实例的底层树也无节点可测）。
+        p = T
+        return (p, p)
+    box0 = _transform_box(root.lo0, root.hi0, M, T)
+    box1 = _transform_box(root.lo1, root.hi1, M, T)
+    return _union_pair(box0, box1)
+
+
+def _build_scene(records, indices):
+    """场景层建树：t=0 参考质心的 8 桶 SAH（复用思路，独立一份），
+    退化时稳定中分；叶至多 _SCENE_LEAF_SIZE 个实例。"""
+    node = _SNode()
+    boxes = []
+    cents = []
+    for j in indices:
+        lo, hi = records[j][5], records[j][6]
+        boxes.append((lo, hi))
+        cents.append(records[j][7])
+        if node.lo is None:
+            node.lo, node.hi = lo, hi
+        else:
+            node.lo = (min(node.lo[0], lo[0]),
+                       min(node.lo[1], lo[1]), min(node.lo[2], lo[2]))
+            node.hi = (max(node.hi[0], hi[0]),
+                       max(node.hi[1], hi[1]), max(node.hi[2], hi[2]))
+
+    n = len(indices)
+    if n <= _SCENE_LEAF_SIZE:
+        node.items = tuple(records[j] for j in indices)
+        return node
+
+    clo = [math.inf] * 3
+    chi = [-math.inf] * 3
+    for c in cents:
+        for k in range(3):
+            if c[k] < clo[k]:
+                clo[k] = c[k]
+            if c[k] > chi[k]:
+                chi[k] = c[k]
+    extent = [chi[k] - clo[k] for k in range(3)]
+    axis = 0
+    if extent[1] > extent[axis]:
+        axis = 1
+    if extent[2] > extent[axis]:
+        axis = 2
+
+    split = _scene_sah_split(indices, boxes, cents, axis, clo[axis], chi[axis])
+    if split is None:
+        split = _scene_mid_split(indices, cents, axis)
+    left_idx, right_idx = split
+    node.left = _build_scene(records, left_idx)
+    node.right = _build_scene(records, right_idx)
+    return node
+
+
+def _scene_sah_split(indices, boxes, cents, axis, cmin, cmax):
+    n = len(indices)
+    if not (cmax > cmin):
+        return None
+    inv = 1.0 / (cmax - cmin)
+    bin_count = [0] * BIN_COUNT
+    bin_lo = [[math.inf] * 3 for _ in range(BIN_COUNT)]
+    bin_hi = [[-math.inf] * 3 for _ in range(BIN_COUNT)]
+    for j, idx in enumerate(indices):
+        x = cents[j][axis]
+        k = int(BIN_COUNT * (x - cmin) * inv)
+        if k >= BIN_COUNT:
+            k = BIN_COUNT - 1
+        bin_count[k] += 1
+        lo, hi = boxes[j]
+        for q in range(3):
+            if lo[q] < bin_lo[k][q]:
+                bin_lo[k][q] = lo[q]
+            if hi[q] > bin_hi[k][q]:
+                bin_hi[k][q] = hi[q]
+
+    prefix = [None] * (BIN_COUNT - 1)
+    cnt = 0
+    plo = [math.inf] * 3
+    phi = [-math.inf] * 3
+    for k in range(BIN_COUNT - 1):
+        cnt += bin_count[k]
+        for q in range(3):
+            if bin_lo[k][q] < plo[q]:
+                plo[q] = bin_lo[k][q]
+            if bin_hi[k][q] > phi[q]:
+                phi[q] = bin_hi[k][q]
+        if cnt:
+            prefix[k] = (cnt, _box_surface_area(plo, phi))
+
+    suffix = [None] * (BIN_COUNT - 1)
+    cnt = 0
+    slo = [math.inf] * 3
+    shi = [-math.inf] * 3
+    for k in range(BIN_COUNT - 1, 0, -1):
+        cnt += bin_count[k]
+        for q in range(3):
+            if bin_lo[k][q] < slo[q]:
+                slo[q] = bin_lo[k][q]
+            if bin_hi[k][q] > shi[q]:
+                shi[q] = bin_hi[k][q]
+        if cnt:
+            suffix[k - 1] = (cnt, _box_surface_area(slo, shi))
+
+    par_lo = [math.inf] * 3
+    par_hi = [-math.inf] * 3
+    for k in range(BIN_COUNT):
+        for q in range(3):
+            if bin_lo[k][q] < par_lo[q]:
+                par_lo[q] = bin_lo[k][q]
+            if bin_hi[k][q] > par_hi[q]:
+                par_hi[q] = bin_hi[k][q]
+    parent_sa = _box_surface_area(par_lo, par_hi)
+    if parent_sa <= 0.0:
+        return None
+
+    best_cost = math.inf
+    best_plane = -1
+    for k in range(BIN_COUNT - 1):
+        lp, rp = prefix[k], suffix[k]
+        if lp is None or rp is None:
+            continue
+        cost = 1.0 + (lp[0] * lp[1] + rp[0] * rp[1]) / parent_sa
+        if cost < best_cost:
+            best_cost = cost
+            best_plane = k
+    if best_plane < 0:
+        return None
+    cut = cmin + (best_plane + 1) * (cmax - cmin) / BIN_COUNT
+    left, right = [], []
+    for j, idx in enumerate(indices):
+        if cents[j][axis] < cut:
+            left.append(idx)
+        else:
+            right.append(idx)
+    if not left or not right:
+        return None
+    if best_cost >= float(n):
+        return None
+    return left, right
+
+
+def _scene_mid_split(indices, cents, axis):
+    order = sorted(
+        range(len(indices)),
+        key=lambda j: (cents[j][axis], cents[j][(axis + 1) % 3],
+                       cents[j][(axis + 2) % 3], indices[j]),
+    )
+    half = len(order) // 2
+    return ([indices[order[j]] for j in range(half)],
+            [indices[order[j]] for j in range(half, len(order))])
+
+
+def _scene_box_hit(lo, hi, o, d, t_min, t_max) -> bool:
+    """Slab 法射线-场景静态 AABB。边界包含；零方向分量单独处理。
+
+    场景盒是 8 角点并集构造的精确（在 binary64 直接运算意义下）保守盒，
+    不做 lerp；为吸收角点变换与 min/max 的舍入，各轴仅外扩 4 ulp 的
+    相对护栏（与底层盒 lerp 护栏同量级），不用它掩盖几何错误。
+    """
+    tnear, tfar = t_min, t_max
+    for k in range(3):
+        lk, hk = lo[k], hi[k]
+        guard = _BOX_GUARD_ULPS * _EPS * max(1.0, abs(lk), abs(hk))
+        lk -= guard
+        hk += guard
+        dk = d[k]
+        if dk == 0.0:
+            if o[k] < lk or o[k] > hk:
+                return False
+            continue
+        t1 = (lk - o[k]) / dk
+        t2 = (hk - o[k]) / dk
+        if t1 < t2:
+            tn, tf = t1, t2
+        else:
+            tn, tf = t2, t1
+        if tn > tnear:
+            tnear = tn
+        if tf < tfar:
+            tfar = tf
+        if tnear > tfar:
+            return False
+    return True
+
+
+def _intersect_scene(scene: SceneBVH, ray: Ray, time, t_min, t_max) -> SceneIntersection:
+    if not isinstance(scene, SceneBVH):
+        raise TypeError("ray 查询目标必须是 motion_bvh.SceneBVH")
+    if not isinstance(ray, Ray):
+        raise TypeError("ray 必须是 motion_bvh.Ray")
+    # 与 _intersect 相同的参数校验（time/t 窗/射线），在进入遍历前完成。
+    tau = _check_real(time, "time")
+    if not (_TIME_LO <= tau <= _TIME_HI):
+        raise ValueError(f"time 必须在 [{_TIME_LO}, {_TIME_HI}] 内，得到 {tau}")
+    t0 = _check_real(t_min, "t_min")
+    if not _is_real(t_max):
+        raise TypeError(
+            f"t_max 必须是实数(int/float)，得到 {type(t_max).__name__}"
+        )
+    t1 = float(t_max)
+    if math.isnan(t1):
+        raise ValueError("t_max 不能是 NaN")
+    if math.isinf(t1) and t1 < 0.0:
+        raise ValueError("t_max 不能是 -Infinity")
+    if t0 > t1:
+        raise ValueError(f"t_min({t0}) 不能大于 t_max({t1})")
+    world_o = _check_point(ray.origin, "ray.origin")
+    if not isinstance(ray.direction, (tuple, list)) or len(ray.direction) != 3:
+        raise TypeError("ray.direction 必须是长度为 3 的序列")
+    world_d = _check_point(ray.direction, "ray.direction")
+    if world_d == (0.0, 0.0, 0.0):
+        raise ValueError("ray.direction 不能为零向量")
+
+    root = scene._root
+    if root is None or root.lo is None:
+        return SceneIntersection(
+            False, None, None, math.nan, math.nan, math.nan, None, 0, 0, 0)
+
+    scene_boxes = 0
+    under_boxes = 0
+    tris_tested = 0
+
+    def tie_tol(a, b):
+        return _TIE_ULPS * _EPS * max(1.0, abs(a), abs(b))
+
+    # 与基线相同的两阶段决胜：全局严格最小 t*，同距带内先 instance_id
+    # 再 face_id。win = (t, u, v, instance_id, face_id, rec, face_idx)
+    abs_best = t1
+    win = None
+
+    def consider_instance(rec):
+        nonlocal under_boxes, tris_tested, abs_best, win
+        iid, bvh, M, invM, T = rec[0], rec[1], rec[2], rec[3], rec[4]
+        # 世界射线 -> 实例局部。方向不做归一化：
+        # P_world = o + t·d = T + M·p_local ⇒ p_local = M⁻¹(o−T) + t·M⁻¹d，
+        # 故局部射线参数与世界参数完全相同。
+        ox = world_o[0] - T[0]
+        oy = world_o[1] - T[1]
+        oz = world_o[2] - T[2]
+        lo = (
+            invM[0][0] * ox + invM[0][1] * oy + invM[0][2] * oz,
+            invM[1][0] * ox + invM[1][1] * oy + invM[1][2] * oz,
+            invM[2][0] * ox + invM[2][1] * oy + invM[2][2] * oz,
+        )
+        ld = (
+            invM[0][0] * world_d[0] + invM[0][1] * world_d[1]
+            + invM[0][2] * world_d[2],
+            invM[1][0] * world_d[0] + invM[1][1] * world_d[1]
+            + invM[1][2] * world_d[2],
+            invM[2][0] * world_d[0] + invM[2][1] * world_d[1]
+            + invM[2][2] * world_d[2],
+        )
+        # invM 可逆 ⇒ 非零向量映为非零向量（构建时已校验），ld 必非零。
+        def window_now():
+            if math.isinf(abs_best):
+                return abs_best
+            return abs_best + (_TIE_ULPS + 2) * _EPS * max(1.0, abs(abs_best))
+
+        brow = bvh._root
+        if brow is None or brow.lo0 is None:
+            return  # 空底层树：无盒可测、无面可测
+        stack = [brow]
+        while stack:
+            node = stack.pop()
+            under_boxes += 1
+            if not _box_hit(node, lo, ld, tau, t0, window_now()):
+                continue
+            if node.faces is not None:
+                for idx in node.faces:
+                    tris_tested += 1
+                    face = bvh._faces[idx]
+                    hit = _triangle_hit(face, lo, ld, tau, t0, window_now())
+                    if hit is None:
+                        continue
+                    ht, hu, hv = hit
+                    if ht > t1:  # 用户窗口硬边界
+                        continue
+                    fid = bvh._face_ids[idx]
+                    key = (iid, fid)
+                    if win is None:
+                        abs_best = ht
+                        win = (ht, hu, hv, iid, fid, rec, idx)
+                    elif ht < abs_best:
+                        abs_best = ht
+                        band = tie_tol(win[0], ht)
+                        if win[0] > ht + band or key < (win[3], win[4]):
+                            win = (ht, hu, hv, iid, fid, rec, idx)
+                    else:
+                        band = tie_tol(ht, abs_best)
+                        if abs(ht - abs_best) <= band and key < (win[3], win[4]):
+                            win = (ht, hu, hv, iid, fid, rec, idx)
+            else:
+                stack.append(node.right)
+                stack.append(node.left)
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        scene_boxes += 1
+        if math.isinf(abs_best):
+            window = abs_best
+        else:
+            window = abs_best + (_TIE_ULPS + 2) * _EPS * max(1.0, abs(abs_best))
+        if not _scene_box_hit(node.lo, node.hi, world_o, world_d, t0, window):
+            continue
+        if node.items is not None:
+            # 叶节点：对其中每个实例先测该实例自己的整区间世界盒
+            # （计入场景盒测试），通过后才进入其底层树。
+            for rec in node.items:
+                scene_boxes += 1
+                if math.isinf(abs_best):
+                    window = abs_best
+                else:
+                    window = abs_best + (_TIE_ULPS + 2) * _EPS * max(
+                        1.0, abs(abs_best))
+                if not _scene_box_hit(rec[5], rec[6], world_o, world_d,
+                                      t0, window):
+                    continue
+                consider_instance(rec)
+        else:
+            stack.append(node.right)
+            stack.append(node.left)
+
+    if win is None:
+        return SceneIntersection(
+            False, None, None, math.nan, math.nan, math.nan, None,
+            scene_boxes, under_boxes, tris_tested,
+        )
+
+    best_t, best_u, best_v, best_iid, best_fid, rec, face_idx = win
+    bvh = rec[1]
+    M, T = rec[2], rec[4]
+    face = bvh._faces[face_idx]
+    # 局部命中点：用局部插值顶点 + 原局部重心坐标组合（与基线口径一致）。
+    a = _vlerp(face[0], face[3], tau)
+    b = _vlerp(face[1], face[4], tau)
+    c = _vlerp(face[2], face[5], tau)
+    w = 1.0 - best_u - best_v
+    lx = w * a[0] + best_u * b[0] + best_v * c[0]
+    ly = w * a[1] + best_u * b[1] + best_v * c[1]
+    lz = w * a[2] + best_u * b[2] + best_v * c[2]
+    # 世界命中点 = M·局部点 + T。
+    point = _apply_affine(M, T, (lx, ly, lz))
+    return SceneIntersection(
+        True, best_iid, best_fid, best_t, best_u, best_v, point,
+        scene_boxes, under_boxes, tris_tested,
+    )
 
 
 # ---------------------------------------------------------------------------

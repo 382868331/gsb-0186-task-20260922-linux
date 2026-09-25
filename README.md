@@ -5,7 +5,9 @@
 - **依赖**：无第三方依赖，不需要网络、账号、密钥、数据库、Docker 或任何中间件
 - **平台**：Linux 原生离线运行
 - **内容**：本题专用模块 `motion_bvh.py`、独立暴力参考 `tests/reference.py`、
-  必要测试 `tests/test_motion_bvh.py`、固定输入演示 `demo.py`
+  必要测试 `tests/test_motion_bvh.py`（单网格基线）与
+  `tests/test_instances.py`（实例场景）、固定输入演示 `demo.py` 与
+  `demo_instances.py`
 
 每个三角形给出 **t=0 与 t=1 两端的三个顶点**，顶点位置在时间 τ∈[0,1] 内
 线性运动 `p(τ)=p0+τ·(p1−p0)`。BVH 每个节点保存 **两端 AABB**，查询时对
@@ -14,8 +16,9 @@
 ## 快速验证
 
 ```bash
-python -m unittest discover -s tests -v   # 41 个测试，约 0.2s
-python demo.py                            # 固定输入演示，约 0.3s，要求 <8s
+python -m unittest discover -s tests -v   # 68 个测试，约 0.5s
+python demo.py                            # 单网格演示，约 0.3s
+python demo_instances.py                  # 实例演示，瞬时完成（要求 <90s）
 ```
 
 demo 真实计算并打印：
@@ -24,6 +27,15 @@ demo 真实计算并打印：
 3. 一个 300 面（接口上限规模）场景 ×240 条射线的批量比对；
 4. 一个**实际触发的拒绝边界**：零方向射线抛出 `ValueError`。
 无 `sleep`、无预录结果。
+
+`demo_instances.py` 真实计算并打印：
+1. 同一棵运动网格 BVH 被 **2 个实例共享**（一个旋转平移，一个镜像+非均匀
+   缩放+剪切），网格只 build 一次；
+2. 两个实例在 **time 端点 τ=0/τ=1**（以及 τ=0.5）都被非单位世界射线命中，
+   返回 `instance_id`、原 `face_id`、世界命中点与原局部重心坐标；
+3. 三类计数（场景盒/底层盒/三角形）与把三角形**显式变换到世界坐标**后
+   逐面求交的独立暴力参考逐条一致；
+4. 一次**实际触发的拒绝**：奇异矩阵批次整体抛 `ValueError`，原场景不受影响。
 
 ## 公开接口
 
@@ -65,6 +77,70 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 - 三角形数 **1 ≤ N ≤ 300**（0 个也合法，表示空场景）；超出抛 `ValueError`。
 - 叶节点三角形数 **≤ 4**；SAH 固定 **8 桶**。
 
+## 实例场景：多实例共享一棵网格 BVH
+
+同一个网格在场景里重复摆放时，**只 build 一次**底层 BVH；每个实例引用该
+BVH，再带自己的 `instance_id` 与固定仿射变换。实例在构建场景后不变
+（本次不含任何网格编辑/重拟合）；网格本身仍按查询的 `time` 参数运动。
+
+```python
+from motion_bvh import (Triangle, Ray, build,
+                       Instance, build_scene, intersect_scene)
+
+bvh = build(triangles)                    # 网格只建一次树
+inst0 = Instance(bvh, instance_id=0,
+                 matrix=((c, -s, 0), (s, c, 0), (0, 0, 1)),
+                 translation=(-4.0, 0.0, 6.0))
+inst1 = Instance(bvh, instance_id=1,
+                 matrix=((-1.3, 0.4, 0), (0, 0.8, 0), (0, 0, 1.6)))  # 镜像+缩放
+scene = build_scene([inst0, inst1])
+hit = intersect_scene(scene, ray, time, t_min=0.0, t_max=math.inf)
+hit = scene.intersect(ray, time, ...)                              # 等价
+```
+
+### 数据结构与语义
+
+| 类型 | 字段 |
+|---|---|
+| `Instance` | `bvh`（已 `build` 的 `BVH`，多个实例可引用同一个对象）、`instance_id`（场景内唯一非负 `int`）、`matrix`（3×3，按行的 3 个长度 3 序列，**必须可逆**）、`translation`（长度 3，缺省 `(0,0,0)`）。世界点 `P = M·p + translation`；允许旋转、非均匀缩放、剪切、镜像（行列式为负） |
+| `SceneIntersection` | `hit`、`instance_id`、`face_id`（原局部网格的 face_id）、`t`、`u`、`v`（**原局部重心坐标**）、`point`（**世界坐标**命中点）、`scene_boxes_tested`、`underlying_boxes_tested`、`triangles_tested`；未命中时 id/point 为 None、t/u/v 为 NaN，计数仍有效 |
+
+- **射线变换**：世界射线 `o+t·d` 被变到实例局部
+  `o'=M⁻¹(o−T)`、`d'=M⁻¹d`；方向**不归一化**，因此局部与世界的射线参数
+  `t` 完全相同。命中点由局部插值顶点与原局部重心坐标组合后再 `M·p+T`
+  变回世界（仿射保持重心坐标，镜像也一样）。
+- **实例包围盒覆盖整运动区间**：取底层根节点 t=0、t=1 两端 AABB 分别
+  仿射变换（8 角点并集）到世界后的**并集**作为保守界，不要求最紧界；
+  顶点线性运动 + 仿射线性 ⇒ 任意 τ 的变换后顶点都在该并集内。
+- **决胜**：同距带沿用基线的 16 ulp 相对容差；带内先比 `instance_id`，
+  再比原 `face_id`。严格更近的命中仍优先于同距规则。两阶段实现，与
+  实例/三角形的遍历顺序无关。
+- **计数三分开**：`scene_boxes_tested` 为场景层 AABB 的射线测试数
+  （含根；进入多实例叶时每个实例自己的盒各计一次）；
+  `underlying_boxes_tested` 为所有被进入实例的底层树节点盒测试总数；
+  `triangles_tested` 为实际三角形求交总数。
+- **共享**：被同一 `BVH` 对象引用的多个实例共享同一份节点与面存储，
+  不复制面列表、不重新建树；场景也允许同时引用若干棵不同的网格树。
+- 空场景 `build_scene([])` 合法（任意查询未命中，三个计数均为 0）；
+  实例也允许引用空 BVH（该实例永不命中）。
+
+### 实例层错误语义（全有或全无）
+
+所有实例**先验证再建场景**，下列任一情况整体抛错且不产生部分场景：
+
+- 重复 `instance_id`、负数 id、bool 充当 id；
+- 矩阵/平移含 NaN/Infinity 等非有限值；矩阵形状不是 3×3；
+- **奇异矩阵**（闭式行列式恰为 0）；
+- 逆矩阵算出**非有限值**（如大元素余因子乘积溢出为 inf/NaN）；
+- 实例世界包围盒计算溢出为非有限值；
+- `bvh` 不是 `BVH`、元素不是 `Instance` 等类型错误。
+
+判定奇异**不设“接近 0”的阈值**：行列式严格非零即接受（因此条件数很大
+但数学上可逆的缩放，如 1e-150 倍，仍正常工作），但一旦逆或包围盒出现
+非有限值就拒绝，不靠放大容差把错误变换混过去。查询参数（time/t 窗/
+零方向等）的校验与单网格 `intersect` 完全一致。旧 `build`/`intersect`
+不受实例层影响，可继续直接使用。
+
 ## 错误语义
 
 - 所有数值标量（顶点、射线原点/方向、time、t_min、t_max）拒绝 **NaN** 与
@@ -102,6 +178,18 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
    `|Δu|,|Δv| ≤ 1e-9`、`|Δpoint| ≤ 1e-8`（双份独立实现的比对口径，
    非边界接受宽限）；**贴边/贴面/顶点/盒角点用例按精确位置构造并要求命中**，
    不靠容差放行。
+5. **实例层附加口径**：世界→局部射线变换用闭式 3×3 求逆；局部命中点经
+   一次 `M·p+T` 回到世界。实例场景测试与“显式世界变换逐面求交”参考的
+   比对阈值为 `|Δt| ≤ 1e-9·max(1,|t|)`、`|Δu|,|Δv| ≤ 1e-9`、
+   世界点 `|Δpoint| ≤ 1e-7`（多一次矩阵乘的舍入）。实例场景盒由 8 角点
+   显式变换取并集，仅外扩 4 ulp 相对护栏抵消角点/ min-max 舍入。
+   **数值适用范围**：矩阵元素与网格坐标及其乘积不溢出 binary64 时按
+   IEEE-754 直接运算处理。已实测的两个极端：1e-150 倍单位缩放
+   （行列式极小但严格非零、无溢出）正常接受并正确查询；元素约 1e200
+   会使余因子乘积溢出，逆/包围盒出现非有限值，此时构建被**拒绝**而不是
+   静默产出错误结果。极度病态（条件数接近 2^53）的矩阵下命中点误差会
+   随条件数放大，这是 binary64 的固有性质，本实现不做扩展精度或
+   无除法求交。
 
 ## 设计取舍
 
@@ -132,14 +220,24 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 - `direction` 不归一化：返回的 t 以 direction 长度为单位。
 - 坐标量级建议在普通 binary64 稳健范围内（约 1e6 以内）；未针对极端
   大坐标/极端细长三角形做鲁棒性增强（如单精度、无除法算法）。
+- **实例层**：实例变换构建后固定，不支持网格编辑/实例增删/重拟合
+  （要改场景就重新 `build_scene`；底层 BVH 可继续复用）。实例包围盒是
+  “两端变换盒并集”的保守界，不是最紧扫掠界，高速运动实例的场景层剪枝
+  可能偏松（不影响正确性）。场景树本身不限制实例数量（接口只对单网格
+  300 面上限负责），但实例极多时场景构建为 O(m log m) 的同构 SAH 建树。
+  极度病态矩阵（条件数接近 2^53）下结果精度随 binary64 固有性质下降。
 
 ## 文件
 
 ```
-motion_bvh.py             # 本题核心模块（build/intersect、公开数据结构）
+motion_bvh.py             # 本题核心模块（build/intersect；实例层
+                          #   Instance/build_scene/intersect_scene）
 tests/__init__.py         # 测试包标识
-tests/reference.py        # 独立暴力参考（逐三角形直接求交，用于期望值）
-tests/test_motion_bvh.py  # 必要测试（41 个）
-demo.py                   # 固定输入演示
+tests/reference.py        # 独立暴力参考（单网格逐面；实例场景把三角形
+                          #   显式变换到世界后逐面，均不调用被测核心）
+tests/test_motion_bvh.py  # 单网格基线测试（41 个）
+tests/test_instances.py   # 实例场景测试（27 个）
+demo.py                   # 单网格固定输入演示
+demo_instances.py         # 实例场景固定输入演示（两个共享实例 + 奇异拒绝）
 README.md
 ```
