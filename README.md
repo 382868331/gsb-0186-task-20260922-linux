@@ -1,11 +1,23 @@
-# motion_bvh — 带运动界的 BVH 射线遍历（纯标准库）
+# motion_bvh — 带运动界的 BVH 射线遍历与最近点查询（纯标准库）
 
 - **Python 版本**：3.14.7（验收版本；仅用标准库 `math` / `dataclasses` / `typing`，
   未在其他版本上验证，不做兼容承诺）
 - **依赖**：无第三方依赖，不需要网络、账号、密钥、数据库、Docker 或任何中间件
 - **平台**：Linux 原生离线运行
 - **内容**：本题专用模块 `motion_bvh.py`、独立暴力参考 `tests/reference.py`、
-  必要测试 `tests/test_motion_bvh.py`、固定输入演示 `demo.py`
+  必要测试 `tests/test_motion_bvh.py` 与 `tests/test_closest_point.py`、
+  固定输入演示 `demo.py` 与 `demo_iteration.py`
+
+## 隔离 venv 准备
+
+无第三方依赖，venv 仅为隔离解释器（也可直接用系统 Python 3.14.7）：
+
+```bash
+python3.14 -m venv .venv        # 或 python -m venv .venv
+. .venv/bin/activate            # 之后所有 python 命令均在隔离环境内
+```
+
+不需要 `pip install` 任何东西；`requirements.txt` 仅注明“仅标准库”。
 
 每个三角形给出 **t=0 与 t=1 两端的三个顶点**，顶点位置在时间 τ∈[0,1] 内
 线性运动 `p(τ)=p0+τ·(p1−p0)`。BVH 每个节点保存 **两端 AABB**，查询时对
@@ -14,8 +26,9 @@
 ## 快速验证
 
 ```bash
-python -m unittest discover -s tests -v   # 41 个测试，约 0.2s
+python -m unittest discover -s tests -v   # 57 个测试（41 基线 + 16 新增），约 0.3s
 python demo.py                            # 固定输入演示，约 0.3s，要求 <8s
+python demo_iteration.py                  # closest_point 增量演示，约 0.1s，远低于 90s
 ```
 
 demo 真实计算并打印：
@@ -28,7 +41,7 @@ demo 真实计算并打印：
 ## 公开接口
 
 ```python
-from motion_bvh import Triangle, Ray, build, intersect
+from motion_bvh import Triangle, Ray, build, intersect, closest_point
 
 tri = Triangle(a0, b0, c0, a1, b1, c1, face_id=None)
 tri = Triangle.stationary(a, b, c, face_id=None)   # 静止三角形语法糖
@@ -36,6 +49,8 @@ ray = Ray(origin=(x,y,z), direction=(dx,dy,dz))
 bvh = build(triangles)                 # -> BVH（构建后只读、可重复查询）
 hit = intersect(bvh, ray, time, t_min=0.0, t_max=math.inf)
 hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
+cp = closest_point(bvh, point, time)   # 最近点查询，不发射射线
+cp = bvh.closest_point(point, time)    # 等价
 ```
 
 ### 数据结构
@@ -45,6 +60,27 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 | `Triangle` | `a0,b0,c0,a1,b1,c1`：各为长度 3 的 `tuple/list` 实数；`face_id` 可选非负 `int`（默认取输入下标 0..N−1，必须互不相同） |
 | `Ray` | `origin`、`direction`：长度 3 实数序列；`direction` 允许含零分量，但**不能为零向量**；不必归一化，命中参数 t 以 direction 为单位 |
 | `Intersection` | `hit`(bool)、`face_id`、`t`、`u`、`v`（`P=(1−u−v)a+ub+vc`）、`point`、`nodes_visited`、`triangles_tested`；未命中时 t/u/v 为 NaN、point/face_id 为 None，**计数字段仍有效** |
+| `ClosestPoint` | `hit`(bool)、`face_id`、`dist_sq`（距离平方）、`u`、`v`（同重心约定）、`point`（表面最近点）、`nodes_visited`、`triangles_tested`；空网格无命中时 dist_sq/u/v 为 NaN、point/face_id 为 None，**计数字段仍有效** |
+
+### closest_point 语义（增量）
+
+- `closest_point(bvh, point, time)`：返回 `time` 时刻网格上距 `point`
+  最近的表面点。**不发射射线**，也不需要事先构造任何 `Ray`。
+- 三角形顶点仍按 `p(τ)=p0+τ·(p1−p0)` 插值；`time` 契约与 `intersect`
+  相同（[0,1] 双闭，越界/NaN/Infinity 抛 `ValueError`，bool 抛 `TypeError`）。
+- **分支限界**：遍历用“点到节点插值包围盒的距离平方下界”剪枝（下界只会
+  偏小、不会偏大，盒外扩量与射线遍历相同），近子节点优先；**不会无条件
+  测全部面**。计数语义：`nodes_visited` 为执行盒距离下界测试的节点数，
+  `triangles_tested` 为实际做逐三角形投影的面数。
+- **退化面**：零面积三角形（退化为线段或点）同样给出最近点与重心坐标
+  （按三条边线段最近点取最小，边顺序 AB→BC→CA 固定，结果确定）。
+- **等距决胜**：严格更近者胜；距离平方之差在 16 ulp 相对容差内视为等距，
+  取 **face_id 最小**者（两阶段实现，与遍历/输入顺序无关）。
+- 空网格（`build([])`）返回 `hit=False`、计数为 0；查询为只读，
+  **不修改树**，可与其他查询任意交错、重复执行结果一致。
+- 逐三角形投影的独立参考实现为 `tests/reference.py` 中的
+  `reference_closest_point`（独立书写，不调用被测核心），覆盖投影落在
+  面内、边上、顶点与运动端点（τ=0/1）的用例见 `tests/test_closest_point.py`。
 
 ### 语义契约
 
@@ -78,10 +114,10 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   `ValueError`。错误消息带可定位前缀，如 `triangles[12].b0[2] ...`、
   `ray.direction 不能为零向量`。
 - **全有或全无**：`build` 先全量校验再构建，非法输入不会产生部分对象；
-  `intersect` 为只读查询，不修改 BVH。
+ `intersect`/`closest_point` 均为只读查询，不修改 BVH。
 - **搜索预算**：本实现**没有**遍历预算/迭代上限这一概念——遍历必然终止，
   “未命中”始终是**已证明无解**（盒层次全部测试完），不存在“预算耗尽但
-  未知是否有解”的第三种结果；`Intersection` 只有命中/未命中两态。
+  未知是否有解”的第三种结果；`Intersection`/`ClosestPoint` 只有命中/未命中两态。
 
 ## 浮点误差口径
 
@@ -97,6 +133,7 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
    （Δu·|e1|+Δv·|e2|，边长 ≤ √3·D），第二项仅抵消 lerp 舍入；
    护栏随盒尺度缩放，**不改变包含关系**（端点盒是端点顶点的精确 min/max）。
 3. **同距带**：16 ulp 相对容差（见上），仅用于判定“同距”，不影响严格更近者。
+   `closest_point` 的同距带作用于**距离平方**（同一相对容差口径）。
 4. **结果精度**：t/u/v/point 由标准浮点运算直接产生，不做迭代修正。
    测试与独立参考的比对阈值为 `|Δt| ≤ 1e-9·max(1,|t|)`、
    `|Δu|,|Δv| ≤ 1e-9`、`|Δpoint| ≤ 1e-8`（双份独立实现的比对口径，
@@ -114,7 +151,10 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 - **运动界**：节点不存“扫掠体凸包”，而是存两端 AABB；查询时插值并外扩，
   对线性顶点运动保守（线性插值的顶点 min/max 被端点 min/max 包含）。
 - **遍历**：显式栈（无递归深度风险），先压右后压左；命中后用当前最近
-  距离（加同距带）收窄盒窗口；为不漏同距面，剪枝窗口含 tie 带宽。
+ 距离（加同距带）收窄盒窗口；为不漏同距面，剪枝窗口含 tie 带宽。
+- **最近点遍历**：同样显式栈；按两子节点的盒距离下界近者优先压栈，
+  下界超过“当前最优 + 同距带”即整棵子树跳过；逐三角形投影用
+  Ericson 5.1.5 区域分类，退化面（法叉积为零）退化为三边线段最近点。
 - **决胜与顺序解耦**：先求严格最小 t 再在同距带内选最小 face_id，
   BVH 与暴力参考（任意顺序）结果一致（开发期 10800 组随机差分 0 不一致）。
 - **独立参考**：`tests/reference.py` 独立抄写一份求交与决胜逻辑，
@@ -127,6 +167,7 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
   可能次优，但结果正确性对任意 τ 成立。
 - 仅支持本文件定义的三角形网格输入与单射线查询；无 Mesh/Material、
   无批量/流式 API、无动态重拟合（refit）、无并行/SIMD 优化。
+  最近点查询同样为单点单次查询，无批量 API。
 - 构建后的 BVH 不可变；多线程并发只读查询是安全的，构建本身未做并发设计。
 - 完全共面/重合的两个面：几何距离相同即按 face_id 决胜，不做摄动消歧。
 - `direction` 不归一化：返回的 t 以 direction 长度为单位。
@@ -136,10 +177,12 @@ hit = bvh.intersect(ray, time, t_min=0.0, t_max=math.inf)   # 等价
 ## 文件
 
 ```
-motion_bvh.py             # 本题核心模块（build/intersect、公开数据结构）
-tests/__init__.py         # 测试包标识
-tests/reference.py        # 独立暴力参考（逐三角形直接求交，用于期望值）
-tests/test_motion_bvh.py  # 必要测试（41 个）
-demo.py                   # 固定输入演示
+motion_bvh.py               # 核心模块（build/intersect/closest_point、公开数据结构）
+tests/__init__.py           # 测试包标识
+tests/reference.py          # 独立暴力参考（逐三角形求交 + 逐三角形投影）
+tests/test_motion_bvh.py    # 基线射线测试（41 个）
+tests/test_closest_point.py # closest_point 增量测试（16 个）
+demo.py                     # 射线遍历固定输入演示
+demo_iteration.py           # closest_point 增量演示（真实离线计算，远低于 90s）
 README.md
 ```

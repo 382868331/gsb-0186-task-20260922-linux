@@ -23,9 +23,11 @@ __all__ = [
     "Triangle",
     "Ray",
     "Intersection",
+    "ClosestPoint",
     "BVH",
     "build",
     "intersect",
+    "closest_point",
 ]
 
 # ---------------------------------------------------------------------------
@@ -194,6 +196,32 @@ class Intersection:
         return self.hit
 
 
+@dataclass(frozen=True, slots=True)
+class ClosestPoint:
+    """最近点查询结果。未命中（空网格）时 hit=False，计数字段仍有效。
+
+    hit              是否找到最近面（空网格为 False）
+    face_id          最近三角形标识；等距时取 face_id 最小者；未命中为 None
+    dist_sq          查询点到表面点的距离平方
+    u, v             重心坐标：P = (1-u-v)*a + u*b + v*c（退化面同样给出）
+    point            表面最近点
+    nodes_visited    执行了包围盒距离下界测试的节点数（含根）
+    triangles_tested 实际做逐三角形投影的面数
+    """
+
+    hit: bool
+    face_id: Optional[int]
+    dist_sq: float
+    u: float
+    v: float
+    point: Optional[tuple]
+    nodes_visited: int
+    triangles_tested: int
+
+    def __bool__(self) -> bool:
+        return self.hit
+
+
 # ---------------------------------------------------------------------------
 # BVH 内部结构
 # ---------------------------------------------------------------------------
@@ -242,6 +270,9 @@ class BVH:
         t_max: float = math.inf,
     ) -> Intersection:
         return _intersect(self, ray, time, t_min, t_max)
+
+    def closest_point(self, point, time: float) -> "ClosestPoint":
+        return _closest_point(self, point, time)
 
 
 # 模块级函数也直接暴露 build/intersect 两个名字
@@ -306,6 +337,10 @@ def intersect(
     """模块级入口，等价于 bvh.intersect(ray, time, t_min, t_max)。"""
     return _intersect(bvh, ray, time, t_min, t_max)
 
+
+def closest_point(bvh: BVH, point, time: float) -> "ClosestPoint":
+    """模块级入口，等价于 bvh.closest_point(point, time)。"""
+    return _closest_point(bvh, point, time)
 
 # ---------------------------------------------------------------------------
 # 构建：8 桶 SAH + 稳定中分兜底
@@ -718,3 +753,238 @@ def _triangle_hit(face, o, d, tau, t_min, t_max):
     if u + v > 1.0:
         v = 1.0 - u
     return t, u, v
+
+
+# ---------------------------------------------------------------------------
+# 最近点查询（分支限界，不发射射线）
+# ---------------------------------------------------------------------------
+
+def _box_dist_sq(node, p, tau) -> float:
+    """查询点到节点 τ 时刻插值包围盒的距离平方（下界）。
+
+    盒外扩量与射线遍历一致（g_eps + 个位 ulp 护栏），保证下界保守：
+    下界只会偏小不会偏大，因此按它剪枝不会误剔真正更近的叶。
+    """
+    lo0, hi0, lo1, hi1 = node.lo0, node.hi0, node.lo1, node.hi1
+    total = 0.0
+    for k in range(3):
+        lo = lo0[k] + tau * (lo1[k] - lo0[k])
+        hi = hi0[k] + tau * (hi1[k] - hi0[k])
+        guard = node.g_eps + _BOX_GUARD_ULPS * _EPS * max(1.0, abs(lo), abs(hi))
+        lo -= guard
+        hi += guard
+        x = p[k]
+        if x < lo:
+            d = lo - x
+            total += d * d
+        elif x > hi:
+            d = x - hi
+            total += d * d
+    return total
+
+
+def _closest_segment_param(p, x, y):
+    """线段 xy 上最近点的参数 s∈[0,1]（x+s*(y-x)）。零长线段返回 0。"""
+    dx = y[0] - x[0]
+    dy = y[1] - x[1]
+    dz = y[2] - x[2]
+    l2 = dx * dx + dy * dy + dz * dz
+    if l2 == 0.0:
+        return 0.0
+    s = ((p[0] - x[0]) * dx + (p[1] - x[1]) * dy
+         + (p[2] - x[2]) * dz) / l2
+    if s <= 0.0:
+        return 0.0
+    if s >= 1.0:
+        return 1.0
+    return s
+
+
+def _closest_tri(p, a, b, c):
+    """点 p 到三角形 abc 的最近点。返回 (dist_sq, u, v)，
+    表面点 P = (1-u-v)*a + u*b + v*c。
+
+    非退化面用 Ericson《Real-Time Collision Detection》5.1.5 区域分类；
+    退化面（法叉积为零：共线或重合顶点）退化为三条边线段的最近点，
+    按 AB、BC、CA 固定顺序取严格更小者，零长线段自然退化为点。
+    """
+    ab = _vsub(b, a)
+    ac = _vsub(c, a)
+    n = _vcross(ab, ac)
+    if _vdot(n, n) == 0.0:
+        return _closest_tri_degenerate(p, a, b, c)
+
+    ap = _vsub(p, a)
+    d1 = _vdot(ab, ap)
+    d2 = _vdot(ac, ap)
+    if d1 <= 0.0 and d2 <= 0.0:
+        return _vdot(ap, ap), 0.0, 0.0  # 顶点 A 区域
+
+    bp = _vsub(p, b)
+    d3 = _vdot(ab, bp)
+    d4 = _vdot(ac, bp)
+    if d3 >= 0.0 and d4 <= d3:
+        return _vdot(bp, bp), 1.0, 0.0  # 顶点 B 区域
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        w = d1 / (d1 - d3)  # 边 AB
+        u, v = w, 0.0
+        q = (a[0] + w * ab[0], a[1] + w * ab[1], a[2] + w * ab[2])
+        return _dist_sq(p, q), u, v
+
+    cp = _vsub(p, c)
+    d5 = _vdot(ab, cp)
+    d6 = _vdot(ac, cp)
+    if d6 >= 0.0 and d5 <= d6:
+        return _vdot(cp, cp), 0.0, 1.0  # 顶点 C 区域
+
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)  # 边 AC
+        u, v = 0.0, w
+        q = (a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2])
+        return _dist_sq(p, q), u, v
+
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))  # 边 BC
+        u, v = 1.0 - w, w
+        q = (b[0] + w * (c[0] - b[0]), b[1] + w * (c[1] - b[1]),
+             b[2] + w * (c[2] - b[2]))
+        return _dist_sq(p, q), u, v
+
+    # 面内部：重心坐标直接给出
+    denom = va + vb + vc
+    v = vb / denom
+    w = vc / denom
+    u = 1.0 - v - w
+    q = (u * a[0] + v * b[0] + w * c[0],
+         u * a[1] + v * b[1] + w * c[1],
+         u * a[2] + v * b[2] + w * c[2])
+    # 输出约定为 (u_b, v_c)：P = (1-u_b-v_c)*a + u_b*b + v_c*c
+    return _dist_sq(p, q), v, w
+
+
+def _dist_sq(p, q) -> float:
+    dx = p[0] - q[0]
+    dy = p[1] - q[1]
+    dz = p[2] - q[2]
+    return dx * dx + dy * dy + dz * dz
+
+
+def _closest_tri_degenerate(p, a, b, c):
+    """退化（零面积）三角形：取三条边线段最近点的最小者。
+
+    覆盖线段（两顶点重合或三点共线）与点（三顶点重合）两种形态。
+    等距时按 AB、BC、CA 固定顺序取先出现者，保证结果确定。
+    """
+    best = None  # (dist_sq, u, v)
+    # 边 AB：P = (1-s)*a + s*b  ->  u=s, v=0
+    s = _closest_segment_param(p, a, b)
+    q = (a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1]),
+         a[2] + s * (b[2] - a[2]))
+    best = (_dist_sq(p, q), s, 0.0)
+    # 边 BC：P = (1-s)*b + s*c  ->  u=1-s, v=s
+    s = _closest_segment_param(p, b, c)
+    q = (b[0] + s * (c[0] - b[0]), b[1] + s * (c[1] - b[1]),
+         b[2] + s * (c[2] - b[2]))
+    d2 = _dist_sq(p, q)
+    if d2 < best[0]:
+        best = (d2, 1.0 - s, s)
+    # 边 CA：P = (1-s)*c + s*a  ->  u=0, v=1-s
+    s = _closest_segment_param(p, c, a)
+    q = (c[0] + s * (a[0] - c[0]), c[1] + s * (a[1] - c[1]),
+         c[2] + s * (a[2] - c[2]))
+    d2 = _dist_sq(p, q)
+    if d2 < best[0]:
+        best = (d2, 0.0, 1.0 - s)
+    return best
+
+
+def _closest_point(bvh: BVH, point, time) -> ClosestPoint:
+    if not isinstance(bvh, BVH):
+        raise TypeError("closest_point 查询目标必须是 motion_bvh.BVH")
+    p = _check_point(point, "point")
+    tau = _check_real(time, "time")
+    if not (_TIME_LO <= tau <= _TIME_HI):
+        raise ValueError(f"time 必须在 [{_TIME_LO}, {_TIME_HI}] 内，得到 {tau}")
+
+    root = bvh._root
+    if root is None or root.lo0 is None:
+        return ClosestPoint(False, None, math.nan, math.nan, math.nan,
+                            None, 0, 0)
+
+    nodes_visited = 0
+    triangles_tested = 0
+
+    # 与 intersect 同构的两阶段决胜：abs_best 为已见严格最小距离平方，
+    # win 为同距带（16 ulp 相对容差）内 face_id 最小的候选。
+    abs_best = math.inf
+    win = None  # (dist_sq, u, v, face_id, face_idx)
+
+    def tie_tol(a, b):
+        return _TIE_ULPS * _EPS * max(1.0, abs(a), abs(b))
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        nodes_visited += 1
+        # 分支限界：盒距离下界已超出当前最优（含同距带）则整棵子树跳过。
+        if math.isinf(abs_best):
+            window = abs_best
+        else:
+            window = abs_best + (_TIE_ULPS + 2) * _EPS * max(
+                1.0, abs(abs_best))
+        if _box_dist_sq(node, p, tau) > window:
+            continue
+        if node.faces is not None:
+            for idx in node.faces:
+                triangles_tested += 1
+                face = bvh._faces[idx]
+                a = _vlerp(face[0], face[3], tau)
+                b = _vlerp(face[1], face[4], tau)
+                c = _vlerp(face[2], face[5], tau)
+                d2, u, v = _closest_tri(p, a, b, c)
+                fid = bvh._face_ids[idx]
+                if win is None:
+                    abs_best = d2
+                    win = (d2, u, v, fid, idx)
+                elif d2 < abs_best:
+                    abs_best = d2
+                    band = tie_tol(win[0], d2)
+                    if win[0] > d2 + band or fid < win[3]:
+                        win = (d2, u, v, fid, idx)
+                else:
+                    band = tie_tol(d2, abs_best)
+                    if abs(d2 - abs_best) <= band and fid < win[3]:
+                        win = (d2, u, v, fid, idx)
+        else:
+            # 近子节点后压栈（先弹出），仅影响剪枝效率，不影响结果
+            dl = _box_dist_sq(node.left, p, tau)
+            dr = _box_dist_sq(node.right, p, tau)
+            if dl <= dr:
+                stack.append(node.right)
+                stack.append(node.left)
+            else:
+                stack.append(node.left)
+                stack.append(node.right)
+
+    if win is None:
+        return ClosestPoint(False, None, math.nan, math.nan, math.nan,
+                            None, nodes_visited, triangles_tested)
+
+    best_d2, best_u, best_v, best_id, best_idx = win
+    face = bvh._faces[best_idx]
+    a = _vlerp(face[0], face[3], tau)
+    b = _vlerp(face[1], face[4], tau)
+    c = _vlerp(face[2], face[5], tau)
+    u, v = best_u, best_v
+    w = 1.0 - u - v
+    px = w * a[0] + u * b[0] + v * c[0]
+    py = w * a[1] + u * b[1] + v * c[1]
+    pz = w * a[2] + u * b[2] + v * c[2]
+    return ClosestPoint(
+        True, best_id, best_d2, u, v, (px, py, pz),
+        nodes_visited, triangles_tested,
+    )
