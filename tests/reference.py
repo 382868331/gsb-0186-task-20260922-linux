@@ -119,3 +119,113 @@ def _tri_by_id(triangles, fid):
         if (tr.face_id if tr.face_id is not None else j) == fid:
             return tr
     raise LookupError(f"reference 内部错误：找不到 face_id={fid}")
+
+
+# ---------------------------------------------------------------------------
+# 最近点独立参考：逐三角形投影（暴力 oracle，不调用被测核心）
+# ---------------------------------------------------------------------------
+
+def _seg_closest(p, a, b):
+    """独立书写的点-线段最近点。返回 (s∈[0,1], 点, 距离平方)。"""
+    ab = _sub(b, a)
+    dd = _dot(ab, ab)
+    if dd == 0.0:
+        d = _sub(p, a)
+        return 0.0, a, _dot(d, d)
+    s = _dot(_sub(p, a), ab) / dd
+    if s < 0.0:
+        s = 0.0
+    elif s > 1.0:
+        s = 1.0
+    q = (a[0] + s * ab[0], a[1] + s * ab[1], a[2] + s * ab[2])
+    d = _sub(p, q)
+    return s, q, _dot(d, d)
+
+
+def _tri_closest(tri, p, tau):
+    """独立书写的点-三角形投影。返回 (u, v, 距离平方)。
+
+    与被测实现不同源：先求平面投影的重心坐标（面积法），落在面内即取之；
+    否则取三条边线段最近点（顺序 ab、bc、ca，严格更小才替换）。
+    零面积退化面自动只剩线段候选；完全共点退化为点。
+    """
+    a = _lerp(tri.a0, tri.a1, tau)
+    b = _lerp(tri.b0, tri.b1, tau)
+    c = _lerp(tri.c0, tri.c1, tau)
+    ab = _sub(b, a)
+    ac = _sub(c, a)
+    best = None  # (d2, u, v)
+
+    n = _cross(ab, ac)
+    nn = _dot(n, n)
+    if nn > 0.0:
+        # 平面投影点 q，再用面积法求重心坐标
+        dist = _dot(_sub(p, a), n) / nn
+        q = (p[0] - dist * n[0], p[1] - dist * n[1], p[2] - dist * n[2])
+        aq = _sub(q, a)
+        d00 = _dot(ab, ab)
+        d01 = _dot(ab, ac)
+        d11 = _dot(ac, ac)
+        d20 = _dot(aq, ab)
+        d21 = _dot(aq, ac)
+        denom = d00 * d11 - d01 * d01
+        if denom > 0.0:
+            u = (d11 * d20 - d01 * d21) / denom
+            v = (d00 * d21 - d01 * d20) / denom
+            w = 1.0 - u - v
+            if u >= 0.0 and v >= 0.0 and w >= 0.0:
+                d = _sub(p, q)
+                best = (_dot(d, d), u, v)
+
+    # 三条边线段候选（也覆盖退化面；bc 边 u=1-s、v=s，ca 边 v=1-s）
+    for p0, p1, to_uv in (
+        (a, b, lambda s: (s, 0.0)),
+        (b, c, lambda s: (1.0 - s, s)),
+        (c, a, lambda s: (0.0, 1.0 - s)),
+    ):
+        s, _q, d2 = _seg_closest(p, p0, p1)
+        u, v = to_uv(s)
+        if best is None or d2 < best[0]:
+            best = (d2, u, v)
+    d2, u, v = best
+    return u, v, d2
+
+
+def reference_closest_point(triangles, point, time):
+    """暴力对全部三角形逐一投影。triangles 为原始 Triangle 列表。
+
+    返回 dict：命中 {hit,face_id,u,v,dist_sq,point,triangles_tested}，
+    空网格 {hit:False, triangles_tested:0}。
+    决胜规则与被测契约一致：严格更近者胜；距离平方差在 16 ulp 相对容差
+    内视为等距，face_id 较小者胜。
+    """
+    p = tuple(float(x) for x in point)
+    tau = float(time)
+    by_id = {}
+    cands = []  # (d2,u,v,fid)
+    tested = 0
+    for i, tri in enumerate(triangles):
+        fid = i if tri.face_id is None else tri.face_id
+        by_id[fid] = tri
+        tested += 1
+        u, v, d2 = _tri_closest(tri, p, tau)
+        cands.append((d2, u, v, fid))
+    assert tested == len(triangles)
+    if not cands:
+        return {"hit": False, "triangles_tested": tested}
+
+    d_star = min(c[0] for c in cands)
+    in_band = [c for c in cands
+               if c[0] - d_star <= _TIE_ULPS * _EPS
+               * max(1.0, abs(c[0]), abs(d_star))]
+    d2, u, v, fid = min(in_band, key=lambda c: c[3])
+    tri = by_id[fid]
+    a = _lerp(tri.a0, tri.a1, tau)
+    b = _lerp(tri.b0, tri.b1, tau)
+    c_ = _lerp(tri.c0, tri.c1, tau)
+    w = 1.0 - u - v
+    point_out = (w * a[0] + u * b[0] + v * c_[0],
+                 w * a[1] + u * b[1] + v * c_[1],
+                 w * a[2] + u * b[2] + v * c_[2])
+    return {"hit": True, "face_id": fid, "u": u, "v": v, "dist_sq": d2,
+            "point": point_out, "triangles_tested": tested}
